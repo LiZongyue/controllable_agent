@@ -610,3 +610,81 @@ class WalkerRandomReward(WalkerEquation):
         selected = cases[rng.choice(range(p.size), p=p)][0]
         super().__init__(selected)
         self._rng = rng
+
+
+## CODE below test after Neurips submission:
+
+# @goal_spaces("walker")
+# def walker_speed_spin(env: dmc.EnvWrapper) -> np.ndarray:
+#     return np.array([
+#         env.physics.torso_height(),
+#         env.physics.torso_upright(),
+#         env.physics.horizontal_velocity(),
+#         env.physics.named.data.subtree_angmom['torso', 'y'],
+#     ], dtype=np.float32)
+
+
+# @goals("walker_speed_spin")
+# def walker_stand() -> np.ndarray:
+#     return np.array([1.2, 1.0, 0.0, 0.0], dtype=np.float32)
+
+# @goals("walker_speed_spin")
+# def walker_walk() -> np.ndarray:
+#     return np.array([1.2, 1.0, 1.0, 0.0], dtype=np.float32)
+
+# @goals("walker_speed_spin")
+# def walker_run() -> np.ndarray:
+#     return np.array([1.2, 1.0, 8.0, 0.0], dtype=np.float32)
+
+# @goals("walker_speed_spin")
+# def walker_flip() -> np.ndarray:
+#     return np.array([1.2, 1.0, 0.0, 5.0], dtype=np.float32)
+
+# @goal_spaces("quadruped")
+# def quadruped_forward_height(env: dmc.EnvWrapper) -> np.ndarray:
+#     return np.array([
+#         env.physics.torso_upright(),
+#         env.physics.torso_velocity()[0],
+#         env.physics.named.data.sensordata['center_of_mass'][2],
+#     ], dtype=np.float32)
+
+
+# @goals("quadruped_forward_height")
+# def quadruped_stand() -> np.ndarray:
+#     return np.array([1.0, 0.0, 0.9], dtype=np.float32)
+
+# @goals("quadruped_forward_height")
+# def quadruped_walk() -> np.ndarray:
+#     return np.array([1.0, 0.5, 0.9], dtype=np.float32)
+
+# @goals("quadruped_forward_height")
+# def quadruped_run() -> np.ndarray:
+#     return np.array([1.0, 5.0, 0.9], dtype=np.float32)
+
+# @goals("quadruped_forward_height")
+# def quadruped_jump() -> np.ndarray:
+#     return np.array([1.0, 0.0, 1.0], dtype=np.float32)
+
+# @goal_spaces("cheetah")
+# def cheetah_speed(env: dmc.EnvWrapper) -> np.ndarray:
+#     return np.array([
+#         env.physics.speed(),
+#         env.physics.angmomentum(),
+#     ], dtype=np.float32)
+
+
+# @goals("cheetah_speed")
+# def cheetah_walk() -> np.ndarray:
+#     return np.array([2.0, 0.0], dtype=np.float32)
+
+# @goals("cheetah_speed")
+# def cheetah_run() -> np.ndarray:
+#     return np.array([10.0, 0.0], dtype=np.float32)
+
+# @goals("cheetah_speed")
+# def cheetah_walk_backward() -> np.ndarray:
+#     return np.array([-2.0, 0.0], dtype=np.float32)
+
+# @goals("cheetah_speed")
+# def cheetah_run_backward() -> np.ndarray:
+#     return np.array([-10.0, 0.0], dtype=np.float32)

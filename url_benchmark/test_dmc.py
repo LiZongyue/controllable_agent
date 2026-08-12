@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import typing as tp
+import numpy as np
 import pytest
 from url_benchmark import dmc
 from url_benchmark.in_memory_replay_buffer import ReplayBuffer
@@ -43,6 +44,14 @@ def test_physics_aggregator() -> None:
     names = [x[0] for x in agg.dump()]
     assert len(names) == 9
     assert not list(agg.dump())
+
+
+def test_vit_observation_is_single_frame_pixels() -> None:
+    env = dmc.make("walker_walk", obs_type="vit", frame_stack=3, action_repeat=1, seed=12, render_shape=(64, 64))
+    time_step = env.reset()
+    assert time_step.observation.shape == (3, 64, 64)
+    assert env.observation_spec().shape == (3, 64, 64)
+    assert time_step.observation.dtype == np.uint8
 
 
 def test_float_stats() -> None:

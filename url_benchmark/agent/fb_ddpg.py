@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 import omegaconf
 from dm_env import specs
+from transformers import AutoConfig, AutoModel
 
 from url_benchmark import utils
 # from url_benchmark import replay_buffer as rb
@@ -28,10 +29,92 @@ from url_benchmark import goals as _goals
 from .ddpg import MetaDict
 from .fb_modules import IdentityMap
 from .ddpg import Encoder
-from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, OnlineCov
+from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, OnlineCov, mlp
 
 
 logger = logging.getLogger(__name__)
+VISUAL_ENCODER_OBS_TYPES = {"pixels", "dino", "vit"}
+
+
+def _warmup_cosine_scale(step: int, warmup_steps: int, decay_steps: int, min_scale: float) -> float:
+    if step < warmup_steps:
+        return float(step + 1) / float(max(1, warmup_steps))
+    if decay_steps <= warmup_steps:
+        return min_scale
+    progress = min(step - warmup_steps, decay_steps - warmup_steps) / float(max(1, decay_steps - warmup_steps))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_scale + (1.0 - min_scale) * cosine
+
+
+@dataclasses.dataclass
+class _WarmupCosineSchedule:
+    warmup_steps: int
+    decay_steps: int
+    min_scale: float
+
+    def __call__(self, step: int) -> float:
+        return _warmup_cosine_scale(
+            step,
+            self.warmup_steps,
+            self.decay_steps,
+            self.min_scale,
+        )
+
+
+def _grad_norm(parameters: tp.Iterable[torch.nn.Parameter]) -> float:
+    grads = [param.grad.detach().norm(2) for param in parameters if param.grad is not None]
+    if not grads:
+        return 0.0
+    return torch.norm(torch.stack(grads), 2).item()
+
+
+def _scale_gradient(value: torch.Tensor, scale: float) -> torch.Tensor:
+    """Preserve the forward value while scaling gradients to its producer."""
+    if not 0.0 <= scale <= 1.0:
+        raise ValueError(f"gradient scale must be in [0, 1], got {scale}")
+    return value.detach() + scale * (value - value.detach())
+
+
+class ViTEncoder(nn.Module):
+    def __init__(
+        self,
+        model_name: str = "facebook/dinov2-base",
+        repr_dim: int = 512,
+        use_cls_token: bool = False,
+    ) -> None:
+        super().__init__()
+        config = AutoConfig.from_pretrained(model_name)
+        self.backbone = AutoModel.from_config(config)
+        self.use_cls_token = use_cls_token
+        self.repr_dim = repr_dim
+
+        hidden_size = int(getattr(config, "hidden_size"))
+        self.projector = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, repr_dim, bias=True),
+        )
+        linear = self.projector[1]
+        nn.init.orthogonal_(linear.weight)
+        nn.init.zeros_(linear.bias)
+
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        obs = obs.float() / 255.0
+        obs = (obs - self.pixel_mean) / self.pixel_std
+        outputs = self.backbone(pixel_values=obs)
+        tokens = outputs.last_hidden_state
+        pooled = tokens[:, 0] if self.use_cls_token else tokens[:, 1:].mean(dim=1)
+        return self.projector(pooled)
 
 
 @dataclasses.dataclass
@@ -66,6 +149,13 @@ class FBDDPGAgentConfig:
     init_fb: bool = True
     update_encoder: bool = omegaconf.II("update_encoder")  # ${update_encoder}
     goal_space: tp.Optional[str] = omegaconf.II("goal_space")
+    use_cls: bool = omegaconf.II("use_cls")
+    dino_use_adapter: bool = True
+    dino_adapter_type: str = "linear"
+    dino_adapter_hidden_dim: int = 1024
+    dino_adapter_output_dim: int = 512
+    dino_separate_backward_adapter: bool = False
+    backward_encoder_grad_scale: float = 1.0
     ortho_coef: float = 1.0  # 0.01-10
     log_std_bounds: tp.Tuple[float, float] = (-5, 2)  # param for DiagGaussianActor
     temp: float = 1  # temperature for DiagGaussianActor
@@ -80,6 +170,14 @@ class FBDDPGAgentConfig:
     q_loss_coef: float = 0.01
     additional_metric: bool = False
     add_trunk: bool = False
+    vit_batch_size: int = 64
+    vit_backbone_lr: float = 3e-5
+    vit_projector_lr: float = 1e-4
+    vit_weight_decay: float = 0.05
+    vit_warmup_steps: int = 2000
+    vit_lr_decay_steps: int = 500000
+    vit_min_lr_scale: float = 0.1
+    vit_encoder_grad_clip: float = 1.0
 
 
 cs = ConfigStore.instance()
@@ -93,6 +191,13 @@ class FBDDPGAgent:
                  **kwargs: tp.Any
                  ):
         cfg = FBDDPGAgentConfig(**kwargs)
+        if cfg.obs_type == "vit" and cfg.batch_size > cfg.vit_batch_size:
+            logger.warning(
+                "Reducing vit batch_size from %s to %s for optimization stability",
+                cfg.batch_size,
+                cfg.vit_batch_size,
+            )
+            cfg.batch_size = cfg.vit_batch_size
         self.cfg = cfg
         assert len(cfg.action_shape) == 1
         self.action_dim = cfg.action_shape[0]
@@ -103,10 +208,54 @@ class FBDDPGAgent:
             self.aug: nn.Module = utils.RandomShiftsAug(pad=4)
             self.encoder: nn.Module = Encoder(cfg.obs_shape).to(cfg.device)
             self.obs_dim = self.encoder.repr_dim
+        elif cfg.obs_type == 'vit':
+            self.aug = nn.Identity()
+            self.encoder = ViTEncoder(repr_dim=512, use_cls_token=cfg.use_cls).to(cfg.device)
+            self.obs_dim = self.encoder.repr_dim
+        elif cfg.obs_type == 'dino':
+            self.aug = nn.Identity()
+            d = cfg.obs_shape[0]
+            if cfg.dino_use_adapter:
+                feature_dim = cfg.dino_adapter_output_dim
+                if cfg.dino_adapter_type == "linear":
+                    self.encoder = nn.Sequential(
+                        nn.LayerNorm(d),
+                        nn.Linear(d, feature_dim, bias=True),
+                    ).to(cfg.device)
+                    linear_layers = [self.encoder[1]]
+                elif cfg.dino_adapter_type == "mlp":
+                    self.encoder = nn.Sequential(
+                        nn.LayerNorm(d),
+                        nn.Linear(d, cfg.dino_adapter_hidden_dim, bias=True),
+                        nn.GELU(),
+                        nn.Linear(cfg.dino_adapter_hidden_dim, feature_dim, bias=True),
+                    ).to(cfg.device)
+                    linear_layers = [self.encoder[1], self.encoder[3]]
+                else:
+                    raise ValueError(f"Unsupported dino_adapter_type={cfg.dino_adapter_type!r}")
+                for linear in linear_layers:
+                    nn.init.orthogonal_(linear.weight)
+                    nn.init.zeros_(linear.bias)
+                self.obs_dim = feature_dim
+            else:
+                self.encoder = nn.Identity()
+                self.obs_dim = d
         else:
             self.aug = nn.Identity()
             self.encoder = nn.Identity()
             self.obs_dim = cfg.obs_shape[0]
+        self.backward_encoder: tp.Optional[nn.Module] = None
+        self.backward_encoder_target: tp.Optional[nn.Module] = None
+        if cfg.dino_separate_backward_adapter:
+            if cfg.obs_type != "dino" or not cfg.dino_use_adapter or cfg.goal_space is not None:
+                raise ValueError(
+                    "dino_separate_backward_adapter requires obs_type='dino', "
+                    "dino_use_adapter=True, and goal_space=None"
+                )
+            # DINO features are computed once by the environment and stored in replay.
+            # Only the lightweight adapter is duplicated for the visual B path.
+            self.backward_encoder = copy.deepcopy(self.encoder).to(cfg.device)
+            self.backward_encoder_target = copy.deepcopy(self.backward_encoder).to(cfg.device)
         if cfg.feature_dim < self.obs_dim:
             logger.warning(f"feature_dim {cfg.feature_dim} should not be smaller that obs_dim {self.obs_dim}")
         goal_dim = self.obs_dim
@@ -140,9 +289,41 @@ class FBDDPGAgent:
         self.forward_target_net.load_state_dict(self.forward_net.state_dict())
         self.backward_target_net.load_state_dict(self.backward_net.state_dict())
         # optimizers
-        self.encoder_opt: tp.Optional[torch.optim.Adam] = None
-        if cfg.obs_type == 'pixels':
-            self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=cfg.lr)
+        self.encoder_opt: tp.Optional[torch.optim.Optimizer] = None
+        self.backward_encoder_opt: tp.Optional[torch.optim.Optimizer] = None
+        self.encoder_scheduler: tp.Optional[torch.optim.lr_scheduler.LambdaLR] = None
+        if cfg.obs_type == "vit":
+            assert isinstance(self.encoder, ViTEncoder)
+            self.encoder_opt = torch.optim.AdamW(
+                [
+                    {
+                        "params": self.encoder.backbone.parameters(),
+                        "lr": cfg.vit_backbone_lr,
+                        "weight_decay": cfg.vit_weight_decay,
+                    },
+                    {
+                        "params": self.encoder.projector.parameters(),
+                        "lr": cfg.vit_projector_lr,
+                        "weight_decay": cfg.vit_weight_decay,
+                    },
+                ]
+            )
+            lr_schedule = _WarmupCosineSchedule(
+                warmup_steps=cfg.vit_warmup_steps,
+                decay_steps=cfg.vit_lr_decay_steps,
+                min_scale=cfg.vit_min_lr_scale,
+            )
+            self.encoder_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.encoder_opt,
+                lr_lambda=[lr_schedule, lr_schedule],
+            )
+        elif cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
+            if cfg.obs_type == "dino" and not cfg.dino_use_adapter:
+                self.encoder_opt = None
+            else:
+                self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=cfg.lr)
+        if self.backward_encoder is not None:
+            self.backward_encoder_opt = torch.optim.Adam(self.backward_encoder.parameters(), lr=cfg.lr)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
         # params = [p for net in [self.forward_net, self.backward_net] for p in net.parameters()]
         # self.fb_opt = torch.optim.Adam(params, lr=cfg.lr)
@@ -160,7 +341,12 @@ class FBDDPGAgent:
 
     def train(self, training: bool = True) -> None:
         self.training = training
-        for net in [self.encoder, self.actor, self.forward_net, self.backward_net]:
+        nets = [self.encoder, self.actor, self.forward_net, self.backward_net]
+        if self.backward_encoder is not None:
+            nets.append(self.backward_encoder)
+        if self.backward_encoder_target is not None:
+            nets.append(self.backward_encoder_target)
+        for net in nets:
             net.train(training)
 
     def init_from(self, other) -> None:
@@ -170,12 +356,30 @@ class FBDDPGAgent:
             names += ["forward_net", "backward_net", "backward_target_net", "forward_target_net"]
         for name in names:
             utils.hard_update_params(getattr(other, name), getattr(self, name))
+        if self.backward_encoder is not None:
+            source_backward_encoder = getattr(other, "backward_encoder", None)
+            if source_backward_encoder is None:
+                # Backward compatibility: initialize the new B adapter from the
+                # formerly shared adapter when loading an older checkpoint.
+                source_backward_encoder = other.encoder
+            utils.hard_update_params(source_backward_encoder, self.backward_encoder)
+            source_backward_encoder_target = getattr(other, "backward_encoder_target", None)
+            if source_backward_encoder_target is None:
+                source_backward_encoder_target = source_backward_encoder
+            assert self.backward_encoder_target is not None
+            utils.hard_update_params(source_backward_encoder_target, self.backward_encoder_target)
         for key, val in self.__dict__.items():
             if isinstance(val, torch.optim.Optimizer):
-                val.load_state_dict(copy.deepcopy(getattr(other, key).state_dict()))
+                source_opt = getattr(other, key, None)
+                if isinstance(source_opt, torch.optim.Optimizer):
+                    val.load_state_dict(copy.deepcopy(source_opt.state_dict()))
 
     def get_goal_meta(self, goal_array: np.ndarray) -> MetaDict:
         desired_goal = torch.tensor(goal_array).unsqueeze(0).to(self.cfg.device)
+        if self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES and (
+            self.cfg.goal_space is None or desired_goal.ndim != 2
+        ):
+            desired_goal = self.backward_aug_and_encode(desired_goal)
         with torch.no_grad():
             z = self.backward_net(desired_goal)
         if self.cfg.norm_z:
@@ -212,6 +416,8 @@ class FBDDPGAgent:
         # obs = obs[idx]
         # reward = reward[idx]
         with torch.no_grad():
+            if self.cfg.goal_space is None and self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
+                obs = self.backward_aug_and_encode(obs)
             B = self.backward_net(obs)
         z = torch.matmul(reward.T, B) / reward.shape[0]
         if self.cfg.norm_z:
@@ -281,12 +487,37 @@ class FBDDPGAgent:
         return action.cpu().numpy()[0]
 
     def compute_z_correl(self, time_step: TimeStep, meta: MetaDict) -> float:
-        goal = time_step.goal if self.cfg.goal_space is not None else time_step.observation  # type: ignore
+        # goal = time_step.goal if self.cfg.goal_space is not None else time_step.observation  # type: ignore
+        # with torch.no_grad():
+        #     zs = [torch.Tensor(x).unsqueeze(0).float().to(self.cfg.device) for x in [goal, meta["z"]]]
+        #     zs[0] = self.backward_net(zs[0])
+        #     zs = [F.normalize(z, 1) for z in zs]
+        #     return torch.matmul(zs[0], zs[1].T).item()
+        goal = time_step.goal if self.cfg.goal_space is not None else time_step.observation
         with torch.no_grad():
-            zs = [torch.Tensor(x).unsqueeze(0).float().to(self.cfg.device) for x in [goal, meta["z"]]]
-            zs[0] = self.backward_net(zs[0])
-            zs = [F.normalize(z, 1) for z in zs]
-            return torch.matmul(zs[0], zs[1].T).item()
+            z_meta = torch.as_tensor(meta["z"], device=self.cfg.device).unsqueeze(0).float()
+
+            # goal -> torch
+            goal_t = torch.as_tensor(goal, device=self.cfg.device).float()
+            if goal_t.ndim == 1:
+                goal_t = goal_t.unsqueeze(0)  # (D,) -> (1,D)
+
+            if self.cfg.goal_space is not None:
+                # goal is low-dim vector, DO NOT aug/encode
+                z_goal = self.backward_net(goal_t)           # (1,z_dim)
+            else:
+                # goal is observation-space
+                if self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
+                    if goal_t.ndim == 3:
+                        goal_t = goal_t.unsqueeze(0)         # (C,H,W)->(1,C,H,W)
+                    goal_feat = self.backward_aug_and_encode(goal_t)  # (1,obs_dim)
+                else:
+                    goal_feat = goal_t
+                z_goal = self.backward_net(goal_feat)
+
+            z_goal = F.normalize(z_goal, dim=1)
+            z_meta = F.normalize(z_meta, dim=1)
+        return (z_goal @ z_meta.T).item()
 
     def update_fb(
         self,
@@ -295,6 +526,7 @@ class FBDDPGAgent:
         discount: torch.Tensor,
         next_obs: torch.Tensor,
         next_goal: torch.Tensor,
+        target_next_goal: torch.Tensor,
         z: torch.Tensor,
         step: int
     ) -> tp.Dict[str, float]:
@@ -309,7 +541,7 @@ class FBDDPGAgent:
                 dist = self.actor(next_obs, z, stddev)
                 next_action = dist.sample(clip=self.cfg.stddev_clip)
             target_F1, target_F2 = self.forward_target_net(next_obs, z, next_action)  # batch x z_dim
-            target_B = self.backward_target_net(next_goal)  # batch x z_dim
+            target_B = self.backward_target_net(target_next_goal)  # batch x z_dim
             target_M1 = torch.einsum('sd, td -> st', target_F1, target_B)  # batch x batch
             target_M2 = torch.einsum('sd, td -> st', target_F2, target_B)  # batch x batch
             target_M = torch.min(target_M1, target_M2)
@@ -375,15 +607,30 @@ class FBDDPGAgent:
             metrics['orth_l2'] = eye_diff.norm().item() / math.sqrt(B.shape[1])
             if isinstance(self.fb_opt, torch.optim.Adam):
                 metrics["fb_opt_lr"] = self.fb_opt.param_groups[0]["lr"]
+            if self.encoder_opt is not None:
+                metrics["encoder_grad_norm"] = _grad_norm(self.encoder.parameters())
+                if self.cfg.obs_type == "vit":
+                    metrics["encoder_lr_backbone"] = self.encoder_opt.param_groups[0]["lr"]
+                    metrics["encoder_lr_projector"] = self.encoder_opt.param_groups[1]["lr"]
+                else:
+                    metrics["encoder_lr"] = self.encoder_opt.param_groups[0]["lr"]
 
         # optimize FB
         if self.encoder_opt is not None:
             self.encoder_opt.zero_grad(set_to_none=True)
+        if self.backward_encoder_opt is not None:
+            self.backward_encoder_opt.zero_grad(set_to_none=True)
         self.fb_opt.zero_grad(set_to_none=True)
         fb_loss.backward()
+        if self.cfg.obs_type == "vit" and self.encoder_opt is not None and self.cfg.update_encoder and self.cfg.vit_encoder_grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.cfg.vit_encoder_grad_clip)
         self.fb_opt.step()
         if self.encoder_opt is not None:
             self.encoder_opt.step()
+        if self.backward_encoder_opt is not None:
+            self.backward_encoder_opt.step()
+        if self.encoder_scheduler is not None and self.cfg.update_encoder:
+            self.encoder_scheduler.step()
         return metrics
 
     def update_actor(self, obs: torch.Tensor, z: torch.Tensor, step: int) -> tp.Dict[str, float]:
@@ -421,8 +668,24 @@ class FBDDPGAgent:
         return metrics
 
     def aug_and_encode(self, obs: torch.Tensor) -> torch.Tensor:
-        obs = self.aug(obs)
+        if obs.ndim == 2:
+            return self.encoder(obs)
+        if self.cfg.obs_type == "vit":
+            return self.encoder(obs)
+        obs = self.aug(obs.float())
         return self.encoder(obs)
+
+    def backward_aug_and_encode(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.backward_encoder is None:
+            return self.aug_and_encode(obs)
+        # A separate backward adapter is only valid for cached 1-D DINO
+        # embeddings, batched here as (batch, feature_dim).
+        return self.backward_encoder(obs)
+
+    def backward_target_aug_and_encode(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.backward_encoder_target is None:
+            return self.backward_aug_and_encode(obs)
+        return self.backward_encoder_target(obs)
 
     def update(self, replay_loader: ReplayBuffer, step: int) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
@@ -437,10 +700,35 @@ class FBDDPGAgent:
         obs = batch.obs
         action = batch.action
         discount = batch.discount
-        next_obs = next_goal = batch.next_obs
+        next_obs = next_goal = target_next_goal = batch.next_obs
         if self.cfg.goal_space is not None:
             assert batch.next_goal is not None
-            next_goal = batch.next_goal
+            next_goal = target_next_goal = batch.next_goal
+
+        if self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
+            obs = self.aug_and_encode(batch.obs)
+            next_obs = self.aug_and_encode(batch.next_obs)
+
+            if self.cfg.goal_space is None:
+                if self.backward_encoder is not None:
+                    next_goal = self.backward_aug_and_encode(batch.next_obs)
+                    with torch.no_grad():
+                        target_next_goal = self.backward_target_aug_and_encode(batch.next_obs)
+                else:
+                    next_goal = next_obs
+                    target_next_goal = next_goal
+                next_goal = _scale_gradient(
+                    next_goal,
+                    self.cfg.backward_encoder_grad_scale,
+                )
+            if self.cfg.goal_space is not None and (next_goal[-1].ndim != 1):
+                next_goal = self.aug_and_encode(next_goal)
+                target_next_goal = next_goal
+            if not self.cfg.update_encoder:
+                obs = obs.detach()
+                next_obs = next_obs.detach()
+                next_goal = next_goal.detach()
+                target_next_goal = target_next_goal.detach()
 
         # if len(batch.meta) == 1 and batch.meta[0].shape[-1] == self.cfg.z_dim:
         #     z = batch.meta[0]
@@ -456,13 +744,31 @@ class FBDDPGAgent:
         # if not self.cfg.update_encoder:
         #     obs = obs.detach()
         #     next_obs = next_obs.detach()
-
         backward_input = batch.obs
         future_goal = batch.future_obs
         if self.cfg.goal_space is not None:
             assert batch.goal is not None
             backward_input = batch.goal
             future_goal = batch.future_goal
+        if self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
+            if self.cfg.goal_space is None:
+                backward_input = self.backward_aug_and_encode(backward_input)
+                future_goal = self.backward_aug_and_encode(future_goal)
+            elif backward_input[-1].ndim != 1:
+                backward_input = self.aug_and_encode(backward_input)
+                future_goal = self.aug_and_encode(future_goal)
+            if not self.cfg.update_encoder:
+                backward_input = backward_input.detach()
+                future_goal = future_goal.detach()
+
+        # if self.cfg.goal_space is None:
+        #     backward_input = obs
+        #     future_goal = self.aug_and_encode(batch.future_obs)
+        #     next_goal = self.aug_and_encode(next_goal)
+        # else:
+        #     assert batch.goal is not None
+        #     backward_input = batch.goal
+        #     future_goal = batch.future_goal
 
         perm = torch.randperm(self.cfg.batch_size)
         backward_input = backward_input[perm]
@@ -491,16 +797,27 @@ class FBDDPGAgent:
             z[future_idxs] = self.backward_net(future_goal[future_idxs]).detach()
 
         metrics.update(self.update_fb(obs=obs, action=action, discount=discount,
-                                      next_obs=next_obs, next_goal=next_goal, z=z, step=step))
+                                      next_obs=next_obs, next_goal=next_goal,
+                                      target_next_goal=target_next_goal, z=z, step=step))
 
         # update actor
-        metrics.update(self.update_actor(obs, z, step))
+        if self.encoder_opt is not None:
+            metrics.update(self.update_actor(obs.detach(), z, step))
+        else:
+            metrics.update(self.update_actor(obs, z, step))
 
         # update critic target
         utils.soft_update_params(self.forward_net, self.forward_target_net,
                                  self.cfg.fb_target_tau)
         utils.soft_update_params(self.backward_net, self.backward_target_net,
                                  self.cfg.fb_target_tau)
+        if self.backward_encoder is not None:
+            assert self.backward_encoder_target is not None
+            utils.soft_update_params(self.backward_encoder, self.backward_encoder_target,
+                                     self.cfg.fb_target_tau)
+
+        # utils.soft_update_params(self.encoder, self.encoder_target,
+        #                          self.cfg.enc_target_tau)
 
         # update inv cov
         # if step % self.cfg.update_cov_every_step == 0:

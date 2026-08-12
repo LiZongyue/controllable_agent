@@ -65,7 +65,7 @@ TASKS = [('reach_top_left', np.array([-0.09, 0.09, _PROP_Z_OFFSET])),
 
 
 def make(task_id, obs_type, seed):
-    obs_settings = observations.VISION if obs_type == 'pixels' else observations.PERFECT_FEATURES
+    obs_settings = observations.VISION if obs_type in {'pixels', 'dino', 'vit'} else observations.PERFECT_FEATURES
     task = _reach(task_id, obs_settings=obs_settings, use_site=True)
     return composer.Environment(task,
                                 time_limit=_TIME_LIMIT,
