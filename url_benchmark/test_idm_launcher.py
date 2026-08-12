@@ -55,6 +55,9 @@ def _run_launcher(
     fake_tmux.chmod(0o755)
 
     env = os.environ.copy()
+    env.pop("EVAL_EVERY_FRAMES", None)
+    env.pop("GPU_ASSIGNMENTS", None)
+    env.pop("PARALLEL_TASKS", None)
     env.update(
         {
             "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
@@ -201,6 +204,7 @@ def test_full_12_task_manifest_budget_and_per_gpu_serial_order(
         "idm_lr",
         "idm_diagnostics_interval",
         "num_train_frames",
+        "eval_every_frames",
         "run_dir",
         "wandb_run_id",
     }
@@ -213,9 +217,12 @@ def test_full_12_task_manifest_budget_and_per_gpu_serial_order(
     assert all(row["idm_lr"] == "0.0001" for row in rows)
     assert all(row["idm_diagnostics_interval"] == "500" for row in rows)
     assert all(row["num_train_frames"] == "500000" for row in rows)
+    assert all(row["eval_every_frames"] == "10000" for row in rows)
     assert len({row["run_dir"] for row in rows}) == 12
     assert len({row["wandb_run_id"] for row in rows}) == 12
     assert len(list(launch_dir.glob("queue_gpu*.sh"))) == 2
+    assert {row["launch_mode"] for row in rows} == {"serial_gpu_queue"}
+    assert len({row["session"] for row in rows}) == 2
     _assert_queue_order(launch_dir / "queue_gpu0.sh", _ALL_TASKS[0::2])
     _assert_queue_order(launch_dir / "queue_gpu1.sh", _ALL_TASKS[1::2])
 
@@ -225,6 +232,97 @@ def test_full_12_task_manifest_budget_and_per_gpu_serial_order(
         assert "agent.idm_coef=0.0" in job_text
         assert "agent.idm_lr=0.0001" in job_text
         assert "agent.idm_diagnostics_interval=500" in job_text
+    assert not tmux_marker.exists()
+
+
+def test_full_12_task_parallel_dry_run_uses_independent_sessions_and_10k_eval(
+    tmp_path: Path,
+) -> None:
+    result, launch_root, _, _, tmux_marker = _run_launcher(
+        tmp_path,
+        root_name="full-parallel",
+        timestamp="parallel",
+        overrides={
+            "GPUS": "0 1",
+            "STAGE": "stage1",
+            "IDM_COEF": "0.0",
+            "IDM_LR": "0.0001",
+            "NUM_TRAIN_FRAMES": "500000",
+            "GPU_ASSIGNMENTS": "1 2 6 7 1 3 5 6 1 4 5 7",
+        },
+        extra_args=("--parallel",),
+    )
+    assert "Dry run only; no tmux sessions were launched." in result.stdout
+    assert not tmux_marker.exists()
+
+    launch_dir = launch_root / "parallel_stage1_idm0p0_idmlr0p0001_f500000"
+    rows = _read_manifest(launch_dir)
+    assert [row["task"] for row in rows] == _ALL_TASKS
+    assert [row["gpu"] for row in rows] == [
+        "1",
+        "2",
+        "6",
+        "7",
+        "1",
+        "3",
+        "5",
+        "6",
+        "1",
+        "4",
+        "5",
+        "7",
+    ]
+    assert {row["launch_mode"] for row in rows} == {"parallel_task"}
+    assert {row["eval_every_frames"] for row in rows} == {"10000"}
+    assert len({row["session"] for row in rows}) == 12
+    assert len({row["job_file"] for row in rows}) == 12
+    assert len({row["session_log"] for row in rows}) == 12
+    assert not list(launch_dir.glob("queue_gpu*.sh"))
+
+    for row in rows:
+        assert row["task"] in row["session"]
+        assert Path(row["job_file"]).name == f"job_{row['task']}.sh"
+        assert Path(row["session_log"]).name == f"session_{row['task']}.log"
+        job_text = Path(row["job_file"]).read_text()
+        assert "eval_every_frames=10000" in job_text
+        assert "num_train_frames=500000" in job_text
+
+
+def test_parallel_tasks_environment_switch_is_supported(tmp_path: Path) -> None:
+    _, launch_root, _, _, tmux_marker = _run_launcher(
+        tmp_path,
+        root_name="parallel-env",
+        timestamp="parallel-env",
+        overrides={
+            "TASKS": "walker_stand walker_walk",
+            "GPUS": "7",
+            "PARALLEL_TASKS": "1",
+        },
+    )
+    rows = _read_manifest(launch_root / "parallel-env")
+    assert len(rows) == 2
+    assert len({row["session"] for row in rows}) == 2
+    assert {row["gpu"] for row in rows} == {"7"}
+    assert {row["launch_mode"] for row in rows} == {"parallel_task"}
+    assert not tmux_marker.exists()
+
+
+def test_gpu_assignments_requires_one_entry_per_selected_task(
+    tmp_path: Path,
+) -> None:
+    result, _, _, _, tmux_marker = _run_launcher(
+        tmp_path,
+        root_name="assignment-count",
+        timestamp="assignment-count",
+        overrides={
+            "TASKS": "walker_stand walker_walk",
+            "GPU_ASSIGNMENTS": "1",
+            "PARALLEL_TASKS": "1",
+        },
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "expected 2, got 1" in result.stderr
     assert not tmux_marker.exists()
 
 

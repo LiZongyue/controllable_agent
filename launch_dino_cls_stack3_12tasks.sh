@@ -9,7 +9,8 @@ LAUNCH_ROOT="${LAUNCH_ROOT:-$RUNS_DIR/launch_queues}"
 WANDB_PROJECT="${WANDB_PROJECT:-controllable_agent_baseline}"
 SEED="${SEED:-1}"
 TASKS="${TASKS:-}"
-EVAL_EVERY_FRAMES="${EVAL_EVERY_FRAMES:-1000}"
+GPU_ASSIGNMENTS="${GPU_ASSIGNMENTS:-}"
+EVAL_EVERY_FRAMES="${EVAL_EVERY_FRAMES:-10000}"
 NUM_TRAIN_FRAMES="${NUM_TRAIN_FRAMES:-2000010}"
 AGENT_LR="${AGENT_LR:-0.0001}"
 IDM_COEF="${IDM_COEF:-0.0}"
@@ -17,6 +18,7 @@ IDM_LR="${IDM_LR:-}"
 IDM_DIAGNOSTICS_INTERVAL="${IDM_DIAGNOSTICS_INTERVAL:-500}"
 STAGE="${STAGE:-}"
 TIMESTAMP="${TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)_dino_cls_stack3}"
+PARALLEL_TASKS="${PARALLEL_TASKS:-0}"
 DRY_RUN=0
 RESUME=0
 
@@ -30,6 +32,10 @@ while [[ $# -gt 0 ]]; do
       RESUME=1
       shift
       ;;
+    --parallel)
+      PARALLEL_TASKS=1
+      shift
+      ;;
     --timestamp)
       if [[ $# -lt 2 ]]; then
         echo "--timestamp requires a value." >&2
@@ -40,11 +46,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       cat <<'EOF'
-Usage: ./launch_dino_cls_stack3_12tasks.sh [--dry-run] [--resume] [--timestamp NAME]
+Usage: ./launch_dino_cls_stack3_12tasks.sh [--dry-run] [--resume] [--parallel] [--timestamp NAME]
 
 Launch task-specific DINOv2 CLS three-frame-stack FB runs. Tasks assigned to
-the same GPU are placed in one serial queue; every task still has its own
-Hydra run directory, checkpoint identity, and W&B run.
+the same GPU are placed in one serial queue by default. Pass --parallel (or set
+PARALLEL_TASKS=1) to launch every selected task in its own tmux session
+immediately, including when multiple tasks are mapped to the same GPU. Every
+task has its own Hydra run directory, checkpoint identity, and W&B run.
 
 Fresh start is the default. If a selected run directory or checkpoint
 directory already exists, the launcher refuses to proceed. Pass --resume only
@@ -52,12 +60,15 @@ when intentionally continuing the exact same setting.
 
 Environment overrides:
   GPUS="6 7"                 Unique GPU ordinals used round-robin.
+  GPU_ASSIGNMENTS=""         Optional GPU ordinal per selected task, in task
+                             order. Entries may repeat and replace round-robin.
   SEED=1
   TASKS="cheetah_walk"       Optional whitespace-separated task subset.
   STAGE=stage1               Optional stable identity suffix; use stage1,
                              stage2, or final when a timestamp is shared.
   NUM_TRAIN_FRAMES=2000010   Set 500000 for Stage 1/2 screening.
-  EVAL_EVERY_FRAMES=1000
+  EVAL_EVERY_FRAMES=10000
+  PARALLEL_TASKS=0           Set 1 for one independent tmux session per task.
   AGENT_LR=0.0001            FB learning rate; kept fixed for IDM ablations.
   IDM_COEF=0.0               Inverse-dynamics auxiliary coefficient.
   IDM_LR=                    Separate IDM-head LR. Empty uses AGENT_LR.
@@ -102,6 +113,14 @@ if [[ ! "$NUM_TRAIN_FRAMES" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "$IDM_DIAGNOSTICS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
   echo "IDM_DIAGNOSTICS_INTERVAL must be a positive integer, got: $IDM_DIAGNOSTICS_INTERVAL" >&2
+  exit 2
+fi
+if [[ ! "$EVAL_EVERY_FRAMES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "EVAL_EVERY_FRAMES must be a positive integer, got: $EVAL_EVERY_FRAMES" >&2
+  exit 2
+fi
+if [[ "$PARALLEL_TASKS" != "0" && "$PARALLEL_TASKS" != "1" ]]; then
+  echo "PARALLEL_TASKS must be 0 or 1, got: $PARALLEL_TASKS" >&2
   exit 2
 fi
 if ! is_positive_number "$AGENT_LR"; then
@@ -168,6 +187,14 @@ for gpu in "${GPUS_ARRAY[@]}"; do
   SEEN_GPUS["$gpu"]=1
 done
 
+read -r -a GPU_ASSIGNMENTS_ARRAY <<< "$GPU_ASSIGNMENTS"
+for gpu in "${GPU_ASSIGNMENTS_ARRAY[@]}"; do
+  if [[ ! "$gpu" =~ ^[0-9]+$ ]]; then
+    echo "GPU_ASSIGNMENTS entries must be non-negative integers, got: $gpu" >&2
+    exit 2
+  fi
+done
+
 TASK_SPECS=(
   "walker_stand simplified_walker"
   "walker_walk simplified_walker"
@@ -214,6 +241,19 @@ if [[ -n "$TASKS" ]]; then
   done
 fi
 
+selected_task_count=0
+for spec in "${TASK_SPECS[@]}"; do
+  read -r task _ <<< "$spec"
+  if task_selected "$task"; then
+    selected_task_count=$((selected_task_count + 1))
+  fi
+done
+if [[ "${#GPU_ASSIGNMENTS_ARRAY[@]}" -gt 0 \
+      && "${#GPU_ASSIGNMENTS_ARRAY[@]}" -ne "$selected_task_count" ]]; then
+  echo "GPU_ASSIGNMENTS must contain exactly one entry per selected task: expected $selected_task_count, got ${#GPU_ASSIGNMENTS_ARRAY[@]}" >&2
+  exit 2
+fi
+
 launch_dir="$LAUNCH_ROOT/$RUN_ID"
 manifest="$launch_dir/manifest.tsv"
 
@@ -234,7 +274,11 @@ for spec in "${TASK_SPECS[@]}"; do
     continue
   fi
 
-  gpu="${GPUS_ARRAY[$((selected_ordinal % ${#GPUS_ARRAY[@]}))]}"
+  if [[ "${#GPU_ASSIGNMENTS_ARRAY[@]}" -gt 0 ]]; then
+    gpu="${GPU_ASSIGNMENTS_ARRAY[$selected_ordinal]}"
+  else
+    gpu="${GPUS_ARRAY[$((selected_ordinal % ${#GPUS_ARRAY[@]}))]}"
+  fi
   domain="${task%%_*}"
   # Scheduling resources are intentionally absent from this identity. Moving a
   # resumable run to another GPU must resolve to the same checkpoint directory.
@@ -386,12 +430,24 @@ append_queue_job() {
   } >> "$queue_file"
 }
 
-mkdir -p "$launch_dir"
-printf 'session\tgpu\tseed\ttask\tgoal_space\trun_dir\tstdout_log\tdomain\tidm_coef\tidm_lr\tidm_diagnostics_interval\tnum_train_frames\tstage\tresume\twandb_run_id\n' > "$manifest"
+session_for_task() {
+  local gpu="$1"
+  local task="$2"
+  if [[ "$PARALLEL_TASKS" -eq 1 ]]; then
+    printf 'dino_s3_%s_s%s_%s' "${RUN_ID//./_}" "$SEED" "$task"
+  else
+    printf 'dino_s3_%s_g%s' "${RUN_ID//./_}" "$gpu"
+  fi
+}
 
-for gpu in "${USED_GPU_ORDER[@]}"; do
-  write_queue_header "$launch_dir/queue_gpu${gpu}.sh"
-done
+mkdir -p "$launch_dir"
+printf 'session\tgpu\tseed\ttask\tgoal_space\trun_dir\tstdout_log\tdomain\tidm_coef\tidm_lr\tidm_diagnostics_interval\tnum_train_frames\teval_every_frames\tstage\tresume\twandb_run_id\tlaunch_mode\tjob_file\tsession_log\n' > "$manifest"
+
+if [[ "$PARALLEL_TASKS" -eq 0 ]]; then
+  for gpu in "${USED_GPU_ORDER[@]}"; do
+    write_queue_header "$launch_dir/queue_gpu${gpu}.sh"
+  done
+fi
 
 for ordinal in "${!SELECTED_TASKS[@]}"; do
   task="${SELECTED_TASKS[$ordinal]}"
@@ -401,40 +457,67 @@ for ordinal in "${!SELECTED_TASKS[@]}"; do
   run_dir="${SELECTED_RUN_DIRS[$ordinal]}"
   job_file="${SELECTED_JOB_FILES[$ordinal]}"
   wandb_run_id="${SELECTED_WANDB_IDS[$ordinal]}"
-  queue_file="$launch_dir/queue_gpu${gpu}.sh"
-  queue_session="dino_s3_${RUN_ID//./_}_g${gpu}"
+  session="$(session_for_task "$gpu" "$task")"
 
   write_job_script "$job_file" "$gpu" "$task" "$goal_space" "$run_dir" "$wandb_run_id"
-  append_queue_job "$queue_file" "$job_file"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$queue_session" "$gpu" "$SEED" "$task" "$goal_space" "$run_dir" "$run_dir/stdout.log" \
-    "$domain" "$IDM_COEF" "$EFFECTIVE_IDM_LR" "$IDM_DIAGNOSTICS_INTERVAL" "$NUM_TRAIN_FRAMES" "${STAGE:-unspecified}" "$RESUME" "$wandb_run_id" \
+  if [[ "$PARALLEL_TASKS" -eq 1 ]]; then
+    launch_mode="parallel_task"
+    session_log="$launch_dir/session_${task}.log"
+  else
+    queue_file="$launch_dir/queue_gpu${gpu}.sh"
+    append_queue_job "$queue_file" "$job_file"
+    launch_mode="serial_gpu_queue"
+    session_log="$launch_dir/queue_gpu${gpu}.log"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$session" "$gpu" "$SEED" "$task" "$goal_space" "$run_dir" "$run_dir/stdout.log" \
+    "$domain" "$IDM_COEF" "$EFFECTIVE_IDM_LR" "$IDM_DIAGNOSTICS_INTERVAL" "$NUM_TRAIN_FRAMES" "$EVAL_EVERY_FRAMES" "${STAGE:-unspecified}" "$RESUME" "$wandb_run_id" \
+    "$launch_mode" "$job_file" "$session_log" \
     >> "$manifest"
-  printf '%s\t%s\t%s\t%s\n' "$queue_session" "$gpu" "$task" "$run_dir"
+  printf '%s\t%s\t%s\t%s\n' "$session" "$gpu" "$task" "$run_dir"
 done
 
-for gpu in "${USED_GPU_ORDER[@]}"; do
-  queue_file="$launch_dir/queue_gpu${gpu}.sh"
-  printf 'exit "$queue_rc"\n' >> "$queue_file"
-  chmod +x "$queue_file"
-done
+if [[ "$PARALLEL_TASKS" -eq 0 ]]; then
+  for gpu in "${USED_GPU_ORDER[@]}"; do
+    queue_file="$launch_dir/queue_gpu${gpu}.sh"
+    printf 'exit "$queue_rc"\n' >> "$queue_file"
+    chmod +x "$queue_file"
+  done
+fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-  # Check every queue first so a collision cannot leave a partially launched
-  # sweep with only some GPUs active.
-  for gpu in "${USED_GPU_ORDER[@]}"; do
-    queue_session="dino_s3_${RUN_ID//./_}_g${gpu}"
-    if tmux has-session -t "$queue_session" >/dev/null 2>&1; then
-      echo "tmux session already exists: $queue_session" >&2
+  # Check every session first so a collision cannot leave a partially launched
+  # sweep. Parallel mode has one session per task; serial mode has one per GPU.
+  declare -a LAUNCH_SESSIONS=()
+  declare -a LAUNCH_FILES=()
+  declare -a LAUNCH_LOGS=()
+  if [[ "$PARALLEL_TASKS" -eq 1 ]]; then
+    for ordinal in "${!SELECTED_TASKS[@]}"; do
+      task="${SELECTED_TASKS[$ordinal]}"
+      gpu="${SELECTED_GPUS[$ordinal]}"
+      LAUNCH_SESSIONS+=("$(session_for_task "$gpu" "$task")")
+      LAUNCH_FILES+=("${SELECTED_JOB_FILES[$ordinal]}")
+      LAUNCH_LOGS+=("$launch_dir/session_${task}.log")
+    done
+  else
+    for gpu in "${USED_GPU_ORDER[@]}"; do
+      LAUNCH_SESSIONS+=("$(session_for_task "$gpu" "")")
+      LAUNCH_FILES+=("$launch_dir/queue_gpu${gpu}.sh")
+      LAUNCH_LOGS+=("$launch_dir/queue_gpu${gpu}.log")
+    done
+  fi
+  for session in "${LAUNCH_SESSIONS[@]}"; do
+    if tmux has-session -t "$session" >/dev/null 2>&1; then
+      echo "tmux session already exists: $session" >&2
       exit 1
     fi
   done
-  for gpu in "${USED_GPU_ORDER[@]}"; do
-    queue_session="dino_s3_${RUN_ID//./_}_g${gpu}"
-    queue_file="$launch_dir/queue_gpu${gpu}.sh"
-    queue_log="$launch_dir/queue_gpu${gpu}.log"
-    tmux new-session -d -s "$queue_session" \
-      "bash $(printf '%q' "$queue_file") > $(printf '%q' "$queue_log") 2>&1"
+  for ordinal in "${!LAUNCH_SESSIONS[@]}"; do
+    session="${LAUNCH_SESSIONS[$ordinal]}"
+    launch_file="${LAUNCH_FILES[$ordinal]}"
+    session_log="${LAUNCH_LOGS[$ordinal]}"
+    tmux new-session -d -s "$session" \
+      "bash $(printf '%q' "$launch_file") > $(printf '%q' "$session_log") 2>&1"
   done
 fi
 
@@ -442,5 +525,9 @@ echo "Manifest: $manifest"
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "Dry run only; no tmux sessions were launched."
 else
-  echo "Launched ${#USED_GPU_ORDER[@]} serial GPU queue(s)."
+  if [[ "$PARALLEL_TASKS" -eq 1 ]]; then
+    echo "Launched ${#SELECTED_TASKS[@]} independent task session(s)."
+  else
+    echo "Launched ${#USED_GPU_ORDER[@]} serial GPU queue(s)."
+  fi
 fi
