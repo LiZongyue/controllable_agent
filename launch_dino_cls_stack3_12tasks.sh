@@ -10,6 +10,17 @@ WANDB_PROJECT="${WANDB_PROJECT:-controllable_agent_baseline}"
 SEED="${SEED:-1}"
 TASKS="${TASKS:-}"
 EVAL_EVERY_FRAMES="${EVAL_EVERY_FRAMES:-1000}"
+IDM_COEF="${IDM_COEF:-0.0}"
+IDM_LR="${IDM_LR:-}"
+IDM_SUFFIX=""
+if awk -v value="$IDM_COEF" 'BEGIN { exit !(value + 0 > 0) }'; then
+  idm_coef_label="${IDM_COEF//./p}"
+  IDM_SUFFIX="_idm${idm_coef_label}"
+  if [[ -n "$IDM_LR" ]]; then
+    idm_lr_label="${IDM_LR//./p}"
+    IDM_SUFFIX+="_idmlr${idm_lr_label}"
+  fi
+fi
 TIMESTAMP="${TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)_dino_cls_stack3}"
 DRY_RUN=0
 
@@ -36,6 +47,10 @@ Environment overrides:
   SEED=1
   TASKS="cheetah_walk"       Optional whitespace-separated task subset.
   EVAL_EVERY_FRAMES=1000     Gives 2000 eval events over 2,000,010 frames.
+  IDM_COEF=0.0               Inverse-dynamics auxiliary coefficient; for
+                             example, set 0.1 to enable it.
+  IDM_LR=                    Optional separate IDM learning rate. Empty uses
+                             the FB learning rate.
   WANDB_PROJECT=controllable_agent_baseline
   REPO_DIR, TRAIN_SCRIPT, RUNS_DIR, CKPT_ROOT, LAUNCH_ROOT, TIMESTAMP
 EOF
@@ -47,6 +62,8 @@ EOF
       ;;
   esac
 done
+
+RUN_ID="${TIMESTAMP}${IDM_SUFFIX}"
 
 read -r -a GPUS_ARRAY <<< "${GPUS:-6 7}"
 if [[ "${#GPUS_ARRAY[@]}" -eq 0 ]]; then
@@ -83,7 +100,7 @@ task_selected() {
   return 1
 }
 
-launch_dir="$LAUNCH_ROOT/$TIMESTAMP"
+launch_dir="$LAUNCH_ROOT/$RUN_ID"
 mkdir -p "$launch_dir"
 manifest="$launch_dir/manifest.tsv"
 printf 'session\tgpu\tseed\ttask\tgoal_space\trun_dir\tstdout_log\n' > "$manifest"
@@ -101,8 +118,8 @@ write_job_script() {
     printf 'cd %q\n' "$REPO_DIR"
     printf 'run_dir=%q\n' "$run_dir"
     printf 'mkdir -p "$run_dir"\n'
-    printf 'echo "[start] $(date -u +%%FT%%TZ) task=%s seed=%s gpu=%s dino_frame_stack=3" | tee "$run_dir/launcher.log"\n' \
-      "$task" "$SEED" "$gpu"
+    printf 'echo "[start] $(date -u +%%FT%%TZ) task=%s seed=%s gpu=%s dino_frame_stack=3 idm_coef=%s idm_lr=%s" | tee "$run_dir/launcher.log"\n' \
+      "$task" "$SEED" "$gpu" "$IDM_COEF" "${IDM_LR:-agent.lr}"
     printf 'if env CUDA_VISIBLE_DEVICES=%q PYTHONUNBUFFERED=1 WANDB_PROJECT=%q python %q ' \
       "$gpu" "$WANDB_PROJECT" "$TRAIN_SCRIPT"
     printf '%q ' \
@@ -123,13 +140,15 @@ write_job_script() {
       "agent.dino_use_adapter=True" \
       "agent.dino_adapter_type=linear" \
       "agent.dino_adapter_output_dim=512" \
+      "agent.idm_coef=$IDM_COEF" \
+      "agent.idm_lr=${IDM_LR:-null}" \
       "agent.batch_size=1024" \
       "agent.update_every_steps=2" \
       "update_encoder=True" \
       "num_train_frames=2000010" \
       "eval_every_frames=$EVAL_EVERY_FRAMES" \
       "num_eval_episodes=10" \
-      "experiment=dino_cls_stack3_seed${SEED}" \
+      "experiment=dino_cls_stack3${IDM_SUFFIX}_seed${SEED}" \
       "task=$task" \
       "goal_space=$goal_space" \
       "seed=$SEED" \
@@ -152,8 +171,8 @@ for index in "${!TASK_SPECS[@]}"; do
     continue
   fi
   gpu="${GPUS_ARRAY[$((index % ${#GPUS_ARRAY[@]}))]}"
-  session="dino_s3_${TIMESTAMP}_s${SEED}_${task}_g${gpu}"
-  run_dir="$RUNS_DIR/${TIMESTAMP}_seed${SEED}_${task}_cuda${gpu}_dino_cls_stack3"
+  session="dino_s3_${RUN_ID}_s${SEED}_${task}_g${gpu}"
+  run_dir="$RUNS_DIR/${TIMESTAMP}_seed${SEED}_${task}_cuda${gpu}_dino_cls_stack3${IDM_SUFFIX}"
   job_file="$launch_dir/${session}.sh"
   group_log="$launch_dir/${session}.log"
 

@@ -156,6 +156,8 @@ class FBDDPGAgentConfig:
     dino_adapter_output_dim: int = 512
     dino_separate_backward_adapter: bool = False
     backward_encoder_grad_scale: float = 1.0
+    idm_coef: float = 0.0
+    idm_lr: tp.Optional[float] = None
     ortho_coef: float = 1.0  # 0.01-10
     log_std_bounds: tp.Tuple[float, float] = (-5, 2)  # param for DiagGaussianActor
     temp: float = 1  # temperature for DiagGaussianActor
@@ -191,6 +193,10 @@ class FBDDPGAgent:
                  **kwargs: tp.Any
                  ):
         cfg = FBDDPGAgentConfig(**kwargs)
+        if cfg.idm_coef < 0:
+            raise ValueError("idm_coef must be non-negative")
+        if cfg.idm_lr is not None and cfg.idm_lr <= 0:
+            raise ValueError("idm_lr must be positive when provided")
         if cfg.obs_type == "vit" and cfg.batch_size > cfg.vit_batch_size:
             logger.warning(
                 "Reducing vit batch_size from %s to %s for optimization stability",
@@ -331,6 +337,18 @@ class FBDDPGAgent:
                                         {'params': self.backward_net.parameters(), 'lr': cfg.lr_coef * cfg.lr}],
                                        lr=cfg.lr)
 
+        # Keep the auxiliary inverse-dynamics model outside the FB networks so
+        # evaluation/inference topology is unchanged.  In particular, do not
+        # initialize it on the disabled path: idm_coef=0 must preserve the
+        # baseline parameter initialization and RNG stream exactly.
+        self.idm_head: tp.Optional[nn.Linear] = None
+        self.idm_optimizer: tp.Optional[torch.optim.Optimizer] = None
+        if cfg.idm_coef > 0:
+            self.idm_head = nn.Linear(2 * self.obs_dim, self.action_dim).to(cfg.device)
+            self.idm_head.apply(utils.weight_init)
+            idm_lr = cfg.lr if cfg.idm_lr is None else cfg.idm_lr
+            self.idm_optimizer = torch.optim.Adam(self.idm_head.parameters(), lr=idm_lr)
+
         self.train()
         self.forward_target_net.train()
         self.backward_target_net.train()
@@ -346,11 +364,20 @@ class FBDDPGAgent:
             nets.append(self.backward_encoder)
         if self.backward_encoder_target is not None:
             nets.append(self.backward_encoder_target)
+        if self.idm_head is not None:
+            nets.append(self.idm_head)
         for net in nets:
             net.train(training)
 
     def init_from(self, other) -> None:
         # copy parameters over
+        source_cfg = getattr(other, "cfg", None)
+        source_uses_idm = getattr(source_cfg, "idm_coef", 0.0) > 0
+        if self.idm_head is not None and source_uses_idm:
+            if getattr(other, "idm_head", None) is None:
+                raise ValueError("IDM-enabled checkpoint is missing idm_head")
+            if not isinstance(getattr(other, "idm_optimizer", None), torch.optim.Optimizer):
+                raise ValueError("IDM-enabled checkpoint is missing idm_optimizer")
         names = ["encoder", "actor"]
         if self.cfg.init_fb:
             names += ["forward_net", "backward_net", "backward_target_net", "forward_target_net"]
@@ -368,6 +395,10 @@ class FBDDPGAgent:
                 source_backward_encoder_target = source_backward_encoder
             assert self.backward_encoder_target is not None
             utils.hard_update_params(source_backward_encoder_target, self.backward_encoder_target)
+        if self.idm_head is not None:
+            source_idm_head = getattr(other, "idm_head", None)
+            if source_idm_head is not None:
+                utils.hard_update_params(source_idm_head, self.idm_head)
         for key, val in self.__dict__.items():
             if isinstance(val, torch.optim.Optimizer):
                 source_opt = getattr(other, key, None)
@@ -579,6 +610,13 @@ class FBDDPGAgent:
         orth_loss = orth_loss_offdiag + orth_loss_diag
         fb_loss += self.cfg.ortho_coef * orth_loss
 
+        if self.idm_head is None:
+            idm_loss = torch.zeros((), device=fb_loss.device, dtype=fb_loss.dtype)
+            total_loss = fb_loss
+        else:
+            idm_loss = self._compute_idm_loss(obs, next_obs, action)
+            total_loss = fb_loss + self.cfg.idm_coef * idm_loss
+
         # Cov = torch.cov(B.T)  # Vicreg loss
         # var_loss = F.relu(1 - Cov.diag().clamp(1e-4, 1).sqrt()).mean()  # eps avoids inf. sqrt gradient at 0
         # cov_loss = 2 * torch.triu(Cov, diagonal=1).pow(2).mean() # 2x upper triangular part
@@ -593,6 +631,8 @@ class FBDDPGAgent:
             metrics['B_norm'] = torch.norm(B, dim=-1).mean().item()
             metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
             metrics['fb_loss'] = fb_loss.item()
+            metrics['idm_loss'] = idm_loss.item()
+            metrics['total_loss'] = total_loss.item()
             metrics['fb_diag'] = fb_diag.item()
             metrics['fb_offdiag'] = fb_offdiag.item()
             if self.cfg.q_loss:
@@ -620,8 +660,10 @@ class FBDDPGAgent:
             self.encoder_opt.zero_grad(set_to_none=True)
         if self.backward_encoder_opt is not None:
             self.backward_encoder_opt.zero_grad(set_to_none=True)
+        if self.idm_optimizer is not None:
+            self.idm_optimizer.zero_grad(set_to_none=True)
         self.fb_opt.zero_grad(set_to_none=True)
-        fb_loss.backward()
+        total_loss.backward()
         if self.cfg.obs_type == "vit" and self.encoder_opt is not None and self.cfg.update_encoder and self.cfg.vit_encoder_grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.cfg.vit_encoder_grad_clip)
         self.fb_opt.step()
@@ -629,9 +671,23 @@ class FBDDPGAgent:
             self.encoder_opt.step()
         if self.backward_encoder_opt is not None:
             self.backward_encoder_opt.step()
+        if self.idm_optimizer is not None:
+            self.idm_optimizer.step()
         if self.encoder_scheduler is not None and self.cfg.update_encoder:
             self.encoder_scheduler.step()
         return metrics
+
+    def _compute_idm_loss(
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict the transition action from consecutive online features."""
+        if self.idm_head is None:
+            raise RuntimeError("Cannot compute IDM loss when idm_coef is zero")
+        idm_input = torch.cat([obs, next_obs], dim=-1)
+        return F.mse_loss(self.idm_head(idm_input), action)
 
     def update_actor(self, obs: torch.Tensor, z: torch.Tensor, step: int) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}

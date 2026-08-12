@@ -126,6 +126,25 @@ ConfigStore.instance().store(name="workspace_config", node=PretrainConfig)
 # # # Implem # # #
 
 
+def _validate_idm_training_config(cfg: tp.Any) -> None:
+    """Keep the IDM auxiliary on the three-frame DINO CLS FB variant."""
+    idm_coef = float(getattr(cfg.agent, "idm_coef", 0.0))
+    idm_lr = getattr(cfg.agent, "idm_lr", None)
+    if idm_coef < 0:
+        raise ValueError("agent.idm_coef must be non-negative")
+    if idm_lr is not None and float(idm_lr) <= 0:
+        raise ValueError("agent.idm_lr must be positive when provided")
+    if (idm_coef != 0 or idm_lr is not None) and (
+        getattr(cfg.agent, "name", None) != "fb_ddpg"
+        or cfg.obs_type != "dino"
+        or not cfg.use_cls
+        or cfg.dino_frame_stack != 3
+    ):
+        raise ValueError(
+            "IDM auxiliary training is supported only for FB with three-frame DINO CLS observations"
+        )
+
+
 def make_agent(
     obs_type: str, obs_spec, action_spec, num_expl_steps: int, cfg: omgcf.DictConfig
 ) -> tp.Union[agents.FBDDPGAgent, agents.DDPGAgent]:
@@ -244,6 +263,7 @@ class BaseWorkspace(tp.Generic[C]):
         logger.info(f'Running code in : {Path(__file__).parent.resolve().absolute()}')
 
         self.cfg = cfg
+        _validate_idm_training_config(cfg)
         utils.set_seed_everywhere(cfg.seed)
         if not torch.cuda.is_available():
             if cfg.device != "cpu":
