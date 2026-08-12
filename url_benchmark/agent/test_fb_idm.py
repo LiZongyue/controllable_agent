@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import dataclasses
 from pathlib import Path
 from unittest import mock
@@ -23,25 +24,31 @@ def _make_agent(
     idm_coef=_OMITTED,
     idm_lr=None,
     goal_space=None,
+    idm_diagnostics_interval=500,
+    update_encoder=True,
+    logging_enabled=True,
+    lr=1e-4,
 ) -> fb_ddpg.FBDDPGAgent:
     kwargs = dict(
         obs_shape=(6,),
         action_shape=(2,),
         obs_type="dino",
         device="cpu",
+        lr=lr,
         num_expl_steps=0,
         goal_space=goal_space,
         use_cls=True,
-        use_tb=True,
+        use_tb=logging_enabled,
         use_wandb=False,
         use_hiplog=False,
-        update_encoder=True,
+        update_encoder=update_encoder,
         batch_size=4,
         hidden_dim=8,
         backward_hidden_dim=8,
         feature_dim=4,
         z_dim=4,
         dino_adapter_output_dim=4,
+        idm_diagnostics_interval=idm_diagnostics_interval,
     )
     if idm_coef is not _OMITTED:
         kwargs["idm_coef"] = idm_coef
@@ -109,6 +116,10 @@ def test_idm_config_validation_and_learning_rate() -> None:
         _make_agent(idm_coef=-0.1)
     with pytest.raises(ValueError, match="idm_lr must be positive"):
         _make_agent(idm_coef=0.1, idm_lr=0.0)
+    with pytest.raises(ValueError, match="idm_diagnostics_interval must be positive"):
+        _make_agent(idm_coef=0.1, idm_diagnostics_interval=0)
+    with pytest.raises(ValueError, match="requires update_encoder=True"):
+        _make_agent(idm_coef=0.1, update_encoder=False)
 
     default_lr = _make_agent(idm_coef=0.1)
     assert default_lr.idm_optimizer is not None
@@ -269,6 +280,198 @@ def test_update_fb_uses_next_observation_and_updates_idm() -> None:
     )
 
 
+def test_idm_prediction_representation_and_gradient_diagnostics() -> None:
+    torch.manual_seed(23)
+    agent = _make_agent(idm_coef=0.3, idm_diagnostics_interval=2)
+    assert agent.idm_head is not None
+    assert agent.encoder_opt is not None
+    assert agent.idm_optimizer is not None
+
+    raw_obs, raw_next_obs, action, discount, z = _fixed_batch()
+    obs = agent.aug_and_encode(raw_obs)
+    next_obs = agent.aug_and_encode(raw_next_obs)
+    with torch.no_grad():
+        prediction = agent._predict_idm_action(obs, next_obs)  # pylint: disable=protected-access
+        error = prediction - action
+        action_var = action.var(dim=0, unbiased=False).mean()
+        pred_var = prediction.var(dim=0, unbiased=False).mean()
+        error_var = error.var(dim=0, unbiased=False).mean()
+        expected_prediction_metrics = {
+            "idm_action_mae": error.abs().mean().item(),
+            "idm_nmse": (F.mse_loss(prediction, action) / (action_var + 1e-12)).item(),
+            "idm_explained_variance": (1.0 - error_var / (action_var + 1e-12)).item(),
+            "action_std": action_var.sqrt().item(),
+            "idm_pred_std": pred_var.sqrt().item(),
+            "h_norm": (0.5 * (obs.norm(dim=-1).mean() + next_obs.norm(dim=-1).mean())).item(),
+            "delta_h_norm": (next_obs - obs).norm(dim=-1).mean().item(),
+        }
+
+    encoder_grad_at_step = []
+    idm_head_grad_at_step = []
+    functional_encoder_grads = []
+    original_encoder_step = agent.encoder_opt.step
+    original_idm_step = agent.idm_optimizer.step
+    original_functional_grad = torch.autograd.grad
+
+    def encoder_step(*args, **kwargs):
+        encoder_grad_at_step.append(
+            tuple(
+                None if parameter.grad is None else parameter.grad.detach().clone()
+                for parameter in agent.encoder.parameters()
+            )
+        )
+        return original_encoder_step(*args, **kwargs)
+
+    def idm_step(*args, **kwargs):
+        idm_head_grad_at_step.append(
+            tuple(
+                None if parameter.grad is None else parameter.grad.detach().clone()
+                for parameter in agent.idm_head.parameters()
+            )
+        )
+        return original_idm_step(*args, **kwargs)
+
+    def functional_grad_call(*args, **kwargs):
+        gradients = original_functional_grad(*args, **kwargs)
+        functional_encoder_grads.append(
+            tuple(None if grad is None else grad.detach().clone() for grad in gradients)
+        )
+        return gradients
+
+    with mock.patch.object(agent.encoder_opt, "step", side_effect=encoder_step) as encoder_step_mock, \
+            mock.patch.object(agent.idm_optimizer, "step", side_effect=idm_step) as idm_step_mock, \
+            mock.patch("torch.autograd.grad", side_effect=functional_grad_call) as functional_grad:
+        torch.manual_seed(99)
+        metrics = agent.update_fb(
+            obs=obs,
+            action=action,
+            discount=discount,
+            next_obs=next_obs,
+            next_goal=next_obs,
+            target_next_goal=next_obs.detach(),
+            z=z,
+            step=0,
+        )
+
+    assert functional_grad.call_count == 2
+    assert encoder_step_mock.call_count == 1
+    assert idm_step_mock.call_count == 1
+    assert metrics["idm_weighted_loss"] == pytest.approx(
+        agent.cfg.idm_coef * metrics["idm_loss"]
+    )
+    for key, expected in expected_prediction_metrics.items():
+        assert metrics[key] == pytest.approx(expected)
+
+    assert metrics["encoder_grad_norm_idm_weighted"] == pytest.approx(
+        agent.cfg.idm_coef * metrics["encoder_grad_norm_idm_unweighted"]
+    )
+    assert metrics["encoder_grad_ratio_idm_fb"] == pytest.approx(
+        metrics["encoder_grad_norm_idm_weighted"]
+        / (metrics["encoder_grad_norm_fb"] + 1e-12)
+    )
+    fb_gradient, idm_gradient = functional_encoder_grads
+    expected_cosine = agent.cfg.idm_coef * fb_ddpg._tensor_grad_dot(
+        fb_gradient, idm_gradient
+    ) / (
+        fb_ddpg._tensor_grad_norm(fb_gradient)
+        * agent.cfg.idm_coef
+        * fb_ddpg._tensor_grad_norm(idm_gradient)
+        + 1e-12
+    )
+    assert metrics["encoder_grad_norm_fb"] == pytest.approx(
+        fb_ddpg._tensor_grad_norm(fb_gradient)
+    )
+    assert metrics["encoder_grad_norm_idm_unweighted"] == pytest.approx(
+        fb_ddpg._tensor_grad_norm(idm_gradient)
+    )
+    assert metrics["encoder_grad_cosine_fb_idm"] == pytest.approx(expected_cosine)
+
+    actual_total_gradient = encoder_grad_at_step[0]
+    for actual, fb_grad, idm_grad in zip(
+        actual_total_gradient, fb_gradient, idm_gradient
+    ):
+        assert actual is not None
+        expected = torch.zeros_like(actual)
+        if fb_grad is not None:
+            expected.add_(fb_grad)
+        if idm_grad is not None:
+            expected.add_(idm_grad, alpha=agent.cfg.idm_coef)
+        torch.testing.assert_close(actual, expected)
+    total_gradient_norm = fb_ddpg._tensor_grad_norm(actual_total_gradient)
+    head_gradient_norm = fb_ddpg._tensor_grad_norm(idm_head_grad_at_step[0])
+    assert metrics["encoder_grad_norm_total"] == pytest.approx(total_gradient_norm)
+    assert metrics["encoder_grad_norm"] == pytest.approx(total_gradient_norm)
+    assert metrics["idm_head_grad_norm"] == pytest.approx(head_gradient_norm)
+    assert metrics["encoder_grad_norm_fb"] > 0
+    assert metrics["encoder_grad_norm_idm_unweighted"] > 0
+    assert metrics["idm_head_grad_norm"] > 0
+
+
+def test_idm_diagnostics_are_sparse_and_do_not_change_training_gradient() -> None:
+    torch.manual_seed(29)
+    diagnosed = _make_agent(idm_coef=0.1, idm_diagnostics_interval=500)
+    torch.manual_seed(29)
+    undiagnosed = _make_agent(idm_coef=0.1, idm_diagnostics_interval=500)
+    # Both agents start identically, but only the zero-indexed first update is
+    # due for diagnostics.
+    undiagnosed._idm_update_count = 1  # pylint: disable=protected-access
+    undiagnosed._idm_diagnostics_pending = False  # pylint: disable=protected-access
+
+    for name in ("encoder", "forward_net", "backward_net", "idm_head"):
+        _assert_module_equal(getattr(diagnosed, name), getattr(undiagnosed, name))
+    for name in ("encoder_opt", "fb_opt", "idm_optimizer"):
+        _assert_nested_equal(
+            getattr(diagnosed, name).state_dict(),
+            getattr(undiagnosed, name).state_dict(),
+        )
+
+    def update_and_capture_encoder_gradient(agent):
+        assert agent.encoder_opt is not None
+        captured = []
+        original_step = agent.encoder_opt.step
+
+        def step(*args, **kwargs):
+            captured.append(
+                tuple(
+                    None if parameter.grad is None else parameter.grad.detach().clone()
+                    for parameter in agent.encoder.parameters()
+                )
+            )
+            return original_step(*args, **kwargs)
+
+        with mock.patch.object(agent.encoder_opt, "step", side_effect=step):
+            update_metrics = _update_fb(agent, _fixed_batch(), seed=101)
+        assert len(captured) == 1
+        return update_metrics, captured[0]
+
+    diagnosed_metrics, diagnosed_gradient = update_and_capture_encoder_gradient(diagnosed)
+    with mock.patch(
+        "torch.autograd.grad",
+        side_effect=AssertionError("functional diagnostics unexpectedly ran"),
+    ):
+        undiagnosed_metrics, undiagnosed_gradient = update_and_capture_encoder_gradient(undiagnosed)
+
+    diagnostic_keys = {
+        "encoder_grad_norm_fb",
+        "encoder_grad_norm_idm_unweighted",
+        "encoder_grad_norm_idm_weighted",
+        "encoder_grad_norm_total",
+        "encoder_grad_ratio_idm_fb",
+        "encoder_grad_cosine_fb_idm",
+        "idm_head_grad_norm",
+    }
+    assert diagnostic_keys <= diagnosed_metrics.keys()
+    assert diagnostic_keys.isdisjoint(undiagnosed_metrics.keys())
+    _assert_nested_equal(diagnosed_gradient, undiagnosed_gradient)
+    for name in ("encoder", "forward_net", "backward_net", "idm_head"):
+        _assert_module_equal(getattr(diagnosed, name), getattr(undiagnosed, name))
+    for name in ("encoder_opt", "fb_opt", "idm_optimizer"):
+        _assert_nested_equal(
+            getattr(diagnosed, name).state_dict(),
+            getattr(undiagnosed, name).state_dict(),
+        )
+
+
 def test_idm_update_supports_low_dimensional_task_goals() -> None:
     agent = _make_agent(idm_coef=0.1, goal_space="simplified_walker")
     batch = rb.EpisodeBatch(
@@ -311,6 +514,7 @@ def test_idm_init_from_restores_head_and_optimizer_and_accepts_legacy_agent(
     restored.init_from(payload["agent"])
     assert restored.idm_head is not None
     assert restored.idm_optimizer is not None
+    assert restored._idm_diagnostics_pending  # pylint: disable=protected-access
     _assert_module_equal(source.idm_head, restored.idm_head)
     _assert_nested_equal(
         source.idm_optimizer.state_dict(),
@@ -319,6 +523,10 @@ def test_idm_init_from_restores_head_and_optimizer_and_accepts_legacy_agent(
 
     # Loading optimizer state is only useful if the resumed trajectory remains
     # identical.  Exercise one more update from the restored checkpoint state.
+    # Suppress the restored process's one-time schema diagnostic here so the
+    # complete metric dictionaries are directly comparable; a dedicated test
+    # below verifies that the diagnostic normally runs.
+    restored._idm_diagnostics_pending = False  # pylint: disable=protected-access
     for agent in (source, restored):
         for optimizer in (agent.encoder_opt, agent.fb_opt, agent.idm_optimizer):
             assert optimizer is not None
@@ -338,13 +546,38 @@ def test_idm_init_from_restores_head_and_optimizer_and_accepts_legacy_agent(
     legacy = _make_agent(idm_coef=0.0)
     del legacy.idm_head
     del legacy.idm_optimizer
+    del legacy._idm_update_count  # pylint: disable=protected-access
+    del legacy.cfg.idm_coef
+    del legacy.cfg.idm_lr
     head_before = {
         key: value.detach().clone()
         for key, value in restored.idm_head.state_dict().items()
     }
     restored.init_from(legacy)
+    assert restored._idm_update_count == 0  # pylint: disable=protected-access
+    assert restored._idm_diagnostics_pending  # pylint: disable=protected-access
     for key, value in restored.idm_head.state_dict().items():
         torch.testing.assert_close(value, head_before[key], rtol=0, atol=0)
+
+
+def test_idm_resume_forces_diagnostics_on_first_post_load_update() -> None:
+    source = _make_agent(idm_coef=0.1, idm_diagnostics_interval=500)
+    _update_fb(source, _fixed_batch())
+    assert source._idm_update_count == 1  # pylint: disable=protected-access
+    assert not source._idm_diagnostics_pending  # pylint: disable=protected-access
+
+    restored = _make_agent(idm_coef=0.1, idm_diagnostics_interval=500)
+    restored.init_from(source)
+    assert restored._idm_update_count == 1  # pylint: disable=protected-access
+    assert restored._idm_diagnostics_pending  # pylint: disable=protected-access
+
+    with mock.patch("torch.autograd.grad", wraps=torch.autograd.grad) as functional_grad:
+        metrics = _update_fb(restored, _fixed_batch(), seed=2718)
+
+    assert functional_grad.call_count == 2
+    assert "encoder_grad_norm_fb" in metrics
+    assert "encoder_grad_norm_idm_unweighted" in metrics
+    assert not restored._idm_diagnostics_pending  # pylint: disable=protected-access
 
 
 @pytest.mark.parametrize("missing", ["idm_head", "idm_optimizer"])
@@ -354,3 +587,62 @@ def test_idm_init_from_rejects_incomplete_idm_checkpoint(missing: str) -> None:
     delattr(source, missing)
     with pytest.raises(ValueError, match=missing):
         destination.init_from(source)
+
+
+@pytest.mark.parametrize(
+    ("source_coef", "source_lr", "destination_coef", "destination_lr", "match"),
+    [
+        (0.1, 1e-4, 0.3, 1e-4, "idm_coef"),
+        (0.1, 1e-4, 0.0, 1e-4, "idm_coef"),
+        (0.0, 1e-4, 0.1, 1e-4, "idm_coef"),
+        (0.1, 1e-4, 0.1, 3e-4, "effective idm_lr"),
+    ],
+)
+def test_idm_init_from_rejects_sweep_mismatch_before_copying(
+    source_coef: float,
+    source_lr: float,
+    destination_coef: float,
+    destination_lr: float,
+    match: str,
+) -> None:
+    torch.manual_seed(31)
+    source = _make_agent(idm_coef=source_coef, idm_lr=source_lr)
+    _update_fb(source, _fixed_batch())
+    torch.manual_seed(37)
+    destination = _make_agent(idm_coef=destination_coef, idm_lr=destination_lr)
+    destination_before = {
+        name: copy.deepcopy(module.state_dict())
+        for name, module in (
+            ("encoder", destination.encoder),
+            ("forward_net", destination.forward_net),
+            ("backward_net", destination.backward_net),
+            ("idm_head", destination.idm_head),
+        )
+        if module is not None
+    }
+
+    with pytest.raises(ValueError, match=match):
+        destination.init_from(source)
+
+    for name, state in destination_before.items():
+        _assert_nested_equal(state, getattr(destination, name).state_dict())
+
+
+def test_idm_init_from_accepts_equivalent_effective_lr_and_rejects_optimizer_lr_drift() -> None:
+    source = _make_agent(idm_coef=0.1, idm_lr=None)
+    destination = _make_agent(idm_coef=0.1, idm_lr=source.cfg.lr)
+    destination.init_from(source)
+
+    assert source.idm_optimizer is not None
+    source.idm_optimizer.param_groups[0]["lr"] = 3e-4
+    destination = _make_agent(idm_coef=0.1, idm_lr=source.cfg.lr)
+    with pytest.raises(ValueError, match="optimizer/config mismatch"):
+        destination.init_from(source)
+
+
+def test_idm_init_from_does_not_apply_idm_guards_to_disabled_agents() -> None:
+    source = _make_agent(idm_coef=0.0, lr=1e-4)
+    destination = _make_agent(idm_coef=0.0, lr=3e-4)
+    # There is no IDM head or IDM optimizer whose sweep configuration could be
+    # corrupted, so ordinary baseline warm-start behavior remains unchanged.
+    destination.init_from(source)

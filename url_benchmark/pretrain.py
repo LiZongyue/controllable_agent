@@ -134,6 +134,8 @@ def _validate_idm_training_config(cfg: tp.Any) -> None:
         raise ValueError("agent.idm_coef must be non-negative")
     if idm_lr is not None and float(idm_lr) <= 0:
         raise ValueError("agent.idm_lr must be positive when provided")
+    if idm_coef > 0 and not bool(getattr(cfg, "update_encoder", False)):
+        raise ValueError("agent.idm_coef > 0 requires update_encoder=True")
     if (idm_coef != 0 or idm_lr is not None) and (
         getattr(cfg.agent, "name", None) != "fb_ddpg"
         or cfg.obs_type != "dino"
@@ -143,6 +145,35 @@ def _validate_idm_training_config(cfg: tp.Any) -> None:
         raise ValueError(
             "IDM auxiliary training is supported only for FB with three-frame DINO CLS observations"
         )
+
+
+def _init_wandb(cfg: tp.Any, exp_name: str) -> None:
+    """Initialize a resumable run with frame-based metric namespaces."""
+    wandb_project = os.environ.get("WANDB_PROJECT", "controllable_agent_baseline")
+    wandb_kwargs: tp.Dict[str, tp.Any] = {}
+    wandb_run_id = os.environ.get("WANDB_RUN_ID")
+    wandb_resume = os.environ.get("WANDB_RESUME")
+    if wandb_resume and not wandb_run_id:
+        raise ValueError("WANDB_RESUME requires a stable WANDB_RUN_ID")
+    if wandb_run_id:
+        wandb_kwargs["id"] = wandb_run_id
+        wandb_kwargs["resume"] = wandb_resume or "allow"
+
+    wandb.init(
+        project=wandb_project,
+        group=cfg.agent.name,
+        name=exp_name,
+        config=omgcf.OmegaConf.to_container(
+            cfg, resolve=True, throw_on_missing=True
+        ),
+        **wandb_kwargs,
+    )  # type: ignore
+    # W&B's internal step is process-local and can jump after checkpoint
+    # recovery. Every experiment metric instead uses environment frames.
+    for namespace in ("train", "eval", "final"):
+        frame_metric = f"{namespace}/frame"
+        wandb.define_metric(frame_metric)
+        wandb.define_metric(f"{namespace}/*", step_metric=frame_metric)
 
 
 def make_agent(
@@ -308,9 +339,7 @@ class BaseWorkspace(tp.Generic[C]):
                 exp_name_parts.append(cfg.agent.dino_adapter_type if cfg.agent.dino_use_adapter else "no_adaptor")
             exp_name_parts.append(cfg.task)
             exp_name = '_'.join(exp_name_parts)
-            wandb_project = os.environ.get("WANDB_PROJECT", "controllable_agent_baseline")
-            wandb.init(project=wandb_project, group=cfg.agent.name, name=exp_name,  # mode="disabled",
-                       config=omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))  # type: ignore
+            _init_wandb(cfg, exp_name)
 
         if cfg.use_hiplog:
             # record config now that it is filled
@@ -446,7 +475,7 @@ class BaseWorkspace(tp.Generic[C]):
             log('step', self.global_step)
             log('episode', self.global_episode)
 
-    def eval(self) -> None:
+    def eval(self, log_metrics: bool = True) -> float:
         step, episode = 0, 0
         eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
         physics_agg = dmc.PhysicsAggregator()
@@ -491,23 +520,26 @@ class BaseWorkspace(tp.Generic[C]):
             episode += 1
             self.video_recorder.save(f'{self.global_frame}.mp4')
 
-        self.eval_rewards_history.append(float(np.mean(rewards)))
-        with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
-            if is_d4rl_task:
-                log('episode_normalized_score', float(100 * np.mean(normalized_scores)))
-            log('episode_reward', self.eval_rewards_history[-1])
-            if len(rewards) > 1:
-                log('episode_reward#std', float(np.std(rewards)))
-            log('episode_length', step * self.cfg.action_repeat / episode)
-            log('episode', self.global_episode)
-            log('z_correl', z_correl / episode)
-            log('step', self.global_step)
-            if actor_success:
-                log('actor_sucess', float(np.mean(actor_success)))
-            if isinstance(self.agent, agents.FBDDPGAgent):
-                log('z_norm', np.linalg.norm(meta['z']).item())
-            for key, val in physics_agg.dump():
-                log(key, val)
+        mean_reward = float(np.mean(rewards))
+        self.eval_rewards_history.append(mean_reward)
+        if log_metrics:
+            with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
+                if is_d4rl_task:
+                    log('episode_normalized_score', float(100 * np.mean(normalized_scores)))
+                log('episode_reward', mean_reward)
+                if len(rewards) > 1:
+                    log('episode_reward#std', float(np.std(rewards)))
+                log('episode_length', step * self.cfg.action_repeat / episode)
+                log('episode', self.global_episode)
+                log('z_correl', z_correl / episode)
+                log('step', self.global_step)
+                if actor_success:
+                    log('actor_sucess', float(np.mean(actor_success)))
+                if isinstance(self.agent, agents.FBDDPGAgent):
+                    log('z_norm', np.linalg.norm(meta['z']).item())
+                for key, val in physics_agg.dump():
+                    log(key, val)
+        return mean_reward
 
     _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode', "replay_loader")
 
@@ -589,38 +621,63 @@ class BaseWorkspace(tp.Generic[C]):
         if not repeat:
             return
 
-        if self.cfg.custom_reward == "maze_multi_goal":
-            eval_hist = self.eval_rewards_history
-            rewards = {}
-            self.eval_rewards_history = []
-            self.cfg.num_eval_episodes = repeat
-            self.eval_maze_goals()
-            rewards["rewards"] = self.eval_rewards_history
-            self.eval_rewards_history = eval_hist  # restore
-        else:
-            domain_tasks = {
-                "cheetah": ['walk', 'walk_backward', 'run', 'run_backward'],
-                "quadruped": ['stand', 'walk', 'run', 'jump'],
-                "walker": ['stand', 'walk', 'run', 'flip'],
-            }
-            if self.domain not in domain_tasks:
-                return
-            eval_hist = self.eval_rewards_history
-            rewards = {}
-            for name in domain_tasks[self.domain]:
-                task = "_".join([self.domain, name])
-                self.cfg.task = task
-                self.cfg.custom_reward = task  # for the replay buffer
-                self.cfg.seed += 1  # for the sake of avoiding similar seeds
-                self.eval_env = self._make_env()
+        training_task = self.cfg.task
+        original_custom_reward = self.cfg.custom_reward
+        original_seed = self.cfg.seed
+        original_num_eval_episodes = self.cfg.num_eval_episodes
+        original_eval_env = self.eval_env
+        eval_hist = self.eval_rewards_history
+        rewards: tp.Dict[str, tp.List[float]] = {}
+        try:
+            if self.cfg.custom_reward == "maze_multi_goal":
                 self.eval_rewards_history = []
-                self.cfg.num_eval_episodes = 1
-                for _ in range(repeat):
-                    self.eval()
-                rewards[task] = self.eval_rewards_history
-        self.eval_rewards_history = eval_hist  # restore
+                self.cfg.num_eval_episodes = repeat
+                self.eval_maze_goals()
+                rewards["rewards"] = list(self.eval_rewards_history)
+            else:
+                domain_tasks = {
+                    "cheetah": ['walk', 'walk_backward', 'run', 'run_backward'],
+                    "quadruped": ['stand', 'walk', 'run', 'jump'],
+                    "walker": ['stand', 'walk', 'run', 'flip'],
+                }
+                if self.domain not in domain_tasks:
+                    return
+                for name in domain_tasks[self.domain]:
+                    task = "_".join([self.domain, name])
+                    self.cfg.task = task
+                    self.cfg.custom_reward = task  # for the replay buffer
+                    self.cfg.seed += 1  # for the sake of avoiding similar seeds
+                    self.eval_env = self._make_env()
+                    self.eval_rewards_history = []
+                    self.cfg.num_eval_episodes = 1
+                    for _ in range(repeat):
+                        # Final cross-task evaluation has its own task-specific
+                        # W&B keys and must not contaminate periodic
+                        # eval/episode_reward for the training task.
+                        self.eval(log_metrics=False)
+                    rewards[task] = list(self.eval_rewards_history)
+        finally:
+            self.cfg.task = training_task
+            self.cfg.custom_reward = original_custom_reward
+            self.cfg.seed = original_seed
+            self.cfg.num_eval_episodes = original_num_eval_episodes
+            self.eval_env = original_eval_env
+            self.eval_rewards_history = eval_hist
+
         with (self.work_dir / "test_rewards.json").open("w") as f:
             json.dump(rewards, f)
+        if self.cfg.use_wandb and self.domain in {"walker", "quadruped", "cheetah"}:
+            final_metrics = {
+                f"final/{task}": float(np.mean(task_rewards))
+                for task, task_rewards in rewards.items()
+            }
+            final_metrics["final/frame"] = self.global_frame
+            wandb.log(final_metrics)
+            if wandb.run is not None:
+                wandb.run.summary["training_task"] = training_task
+                wandb.run.summary["final_eval_domain"] = self.domain
+                for key, value in final_metrics.items():
+                    wandb.run.summary[key] = value
 
 
 class Workspace(BaseWorkspace[PretrainConfig]):

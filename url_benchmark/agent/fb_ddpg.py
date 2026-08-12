@@ -68,6 +68,34 @@ def _grad_norm(parameters: tp.Iterable[torch.nn.Parameter]) -> float:
     return torch.norm(torch.stack(grads), 2).item()
 
 
+def _tensor_grad_norm(grads: tp.Iterable[tp.Optional[torch.Tensor]]) -> float:
+    """Return the global L2 norm of functional gradients without touching ``.grad``."""
+    squared_norms = [grad.detach().pow(2).sum() for grad in grads if grad is not None]
+    if not squared_norms:
+        return 0.0
+    return torch.stack(squared_norms).sum().sqrt().item()
+
+
+def _tensor_grad_dot(
+    left: tp.Iterable[tp.Optional[torch.Tensor]],
+    right: tp.Iterable[tp.Optional[torch.Tensor]],
+) -> float:
+    """Return a parameter-wise dot product, treating unused gradients as zero."""
+    products = [
+        left_grad.detach().mul(right_grad.detach()).sum()
+        for left_grad, right_grad in zip(left, right)
+        if left_grad is not None and right_grad is not None
+    ]
+    if not products:
+        return 0.0
+    return torch.stack(products).sum().item()
+
+
+def _effective_idm_lr(cfg: tp.Any) -> float:
+    idm_lr = getattr(cfg, "idm_lr", None)
+    return float(cfg.lr if idm_lr is None else idm_lr)
+
+
 def _scale_gradient(value: torch.Tensor, scale: float) -> torch.Tensor:
     """Preserve the forward value while scaling gradients to its producer."""
     if not 0.0 <= scale <= 1.0:
@@ -158,6 +186,7 @@ class FBDDPGAgentConfig:
     backward_encoder_grad_scale: float = 1.0
     idm_coef: float = 0.0
     idm_lr: tp.Optional[float] = None
+    idm_diagnostics_interval: int = 500
     ortho_coef: float = 1.0  # 0.01-10
     log_std_bounds: tp.Tuple[float, float] = (-5, 2)  # param for DiagGaussianActor
     temp: float = 1  # temperature for DiagGaussianActor
@@ -197,6 +226,10 @@ class FBDDPGAgent:
             raise ValueError("idm_coef must be non-negative")
         if cfg.idm_lr is not None and cfg.idm_lr <= 0:
             raise ValueError("idm_lr must be positive when provided")
+        if cfg.idm_diagnostics_interval <= 0:
+            raise ValueError("idm_diagnostics_interval must be positive")
+        if cfg.idm_coef > 0 and not cfg.update_encoder:
+            raise ValueError("idm_coef > 0 requires update_encoder=True")
         if cfg.obs_type == "vit" and cfg.batch_size > cfg.vit_batch_size:
             logger.warning(
                 "Reducing vit batch_size from %s to %s for optimization stability",
@@ -346,8 +379,17 @@ class FBDDPGAgent:
         if cfg.idm_coef > 0:
             self.idm_head = nn.Linear(2 * self.obs_dim, self.action_dim).to(cfg.device)
             self.idm_head.apply(utils.weight_init)
-            idm_lr = cfg.lr if cfg.idm_lr is None else cfg.idm_lr
-            self.idm_optimizer = torch.optim.Adam(self.idm_head.parameters(), lr=idm_lr)
+            self.idm_optimizer = torch.optim.Adam(
+                self.idm_head.parameters(), lr=_effective_idm_lr(cfg)
+            )
+        # This is an optimizer-update counter rather than an environment-step
+        # counter.  Starting at zero also guarantees that sparse diagnostic
+        # fields are present in the first logger/CSV schema.
+        self._idm_update_count = 0
+        # This flag is deliberately per process rather than checkpoint state.
+        # A resumed logger rebuilds its CSV writer from the first post-resume
+        # metrics, so that update must contain the sparse diagnostic fields.
+        self._idm_diagnostics_pending = True
 
         self.train()
         self.forward_target_net.train()
@@ -372,12 +414,53 @@ class FBDDPGAgent:
     def init_from(self, other) -> None:
         # copy parameters over
         source_cfg = getattr(other, "cfg", None)
-        source_uses_idm = getattr(source_cfg, "idm_coef", 0.0) > 0
+        # A pre-IDM pickle has no instance fields for either option.  Testing
+        # vars(), rather than getattr(), matters because dataclass defaults on
+        # the newly imported class would otherwise make a legacy config look
+        # like an explicitly configured modern checkpoint.
+        source_has_idm_config = source_cfg is not None and (
+            "idm_coef" in vars(source_cfg) or "idm_lr" in vars(source_cfg)
+        )
+        source_uses_idm = source_has_idm_config and float(getattr(source_cfg, "idm_coef", 0.0)) > 0
+
+        # Validate the complete resume contract before copying even one tensor.
+        # In particular, loading an Adam state also loads its param-group LR;
+        # rejecting mismatches here prevents a checkpoint from silently
+        # overriding the requested sweep setting.
+        if source_has_idm_config:
+            source_idm_coef = float(getattr(source_cfg, "idm_coef", 0.0))
+        else:
+            source_idm_coef = 0.0
+        if source_has_idm_config and (
+            source_idm_coef > 0 or float(self.cfg.idm_coef) > 0
+        ):
+            if source_idm_coef != float(self.cfg.idm_coef):
+                raise ValueError(
+                    "IDM checkpoint/config mismatch: "
+                    f"idm_coef={source_idm_coef} in checkpoint but {self.cfg.idm_coef} requested"
+                )
+            source_idm_lr = _effective_idm_lr(source_cfg)
+            requested_idm_lr = _effective_idm_lr(self.cfg)
+            if source_idm_lr != requested_idm_lr:
+                raise ValueError(
+                    "IDM checkpoint/config mismatch: "
+                    f"effective idm_lr={source_idm_lr} in checkpoint but "
+                    f"{requested_idm_lr} requested"
+                )
         if self.idm_head is not None and source_uses_idm:
             if getattr(other, "idm_head", None) is None:
                 raise ValueError("IDM-enabled checkpoint is missing idm_head")
-            if not isinstance(getattr(other, "idm_optimizer", None), torch.optim.Optimizer):
+            source_idm_optimizer = getattr(other, "idm_optimizer", None)
+            if not isinstance(source_idm_optimizer, torch.optim.Optimizer):
                 raise ValueError("IDM-enabled checkpoint is missing idm_optimizer")
+            requested_idm_lr = _effective_idm_lr(self.cfg)
+            checkpoint_lrs = {float(group["lr"]) for group in source_idm_optimizer.param_groups}
+            if checkpoint_lrs != {requested_idm_lr}:
+                raise ValueError(
+                    "IDM checkpoint optimizer/config mismatch: "
+                    f"optimizer lr(s)={sorted(checkpoint_lrs)} but "
+                    f"effective idm_lr={requested_idm_lr} requested"
+                )
         names = ["encoder", "actor"]
         if self.cfg.init_fb:
             names += ["forward_net", "backward_net", "backward_target_net", "forward_target_net"]
@@ -404,6 +487,10 @@ class FBDDPGAgent:
                 source_opt = getattr(other, key, None)
                 if isinstance(source_opt, torch.optim.Optimizer):
                     val.load_state_dict(copy.deepcopy(source_opt.state_dict()))
+        self._idm_update_count = int(getattr(other, "_idm_update_count", 0))
+        # Do not restore this per-process flag: the first update after every
+        # load must repopulate sparse logger fields before the first dump.
+        self._idm_diagnostics_pending = True
 
     def get_goal_meta(self, goal_array: np.ndarray) -> MetaDict:
         desired_goal = torch.tensor(goal_array).unsqueeze(0).to(self.cfg.device)
@@ -610,11 +697,15 @@ class FBDDPGAgent:
         orth_loss = orth_loss_offdiag + orth_loss_diag
         fb_loss += self.cfg.ortho_coef * orth_loss
 
+        idm_prediction: tp.Optional[torch.Tensor] = None
         if self.idm_head is None:
             idm_loss = torch.zeros((), device=fb_loss.device, dtype=fb_loss.dtype)
             total_loss = fb_loss
         else:
-            idm_loss = self._compute_idm_loss(obs, next_obs, action)
+            idm_prediction = self._predict_idm_action(obs, next_obs)
+            idm_loss = self._compute_idm_loss(
+                obs, next_obs, action, prediction=idm_prediction
+            )
             total_loss = fb_loss + self.cfg.idm_coef * idm_loss
 
         # Cov = torch.cov(B.T)  # Vicreg loss
@@ -623,7 +714,8 @@ class FBDDPGAgent:
         # orth_loss =  var_loss + cov_loss
         # fb_loss += self.cfg.ortho_coef * orth_loss
 
-        if self.cfg.use_tb or self.cfg.use_wandb or self.cfg.use_hiplog:
+        logging_enabled = self.cfg.use_tb or self.cfg.use_wandb or self.cfg.use_hiplog
+        if logging_enabled:
             metrics['target_M'] = target_M.mean().item()
             metrics['M1'] = M1.mean().item()
             metrics['F1'] = F1.mean().item()
@@ -632,6 +724,7 @@ class FBDDPGAgent:
             metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
             metrics['fb_loss'] = fb_loss.item()
             metrics['idm_loss'] = idm_loss.item()
+            metrics['idm_weighted_loss'] = self.cfg.idm_coef * idm_loss.item()
             metrics['total_loss'] = total_loss.item()
             metrics['fb_diag'] = fb_diag.item()
             metrics['fb_offdiag'] = fb_offdiag.item()
@@ -648,12 +741,29 @@ class FBDDPGAgent:
             if isinstance(self.fb_opt, torch.optim.Adam):
                 metrics["fb_opt_lr"] = self.fb_opt.param_groups[0]["lr"]
             if self.encoder_opt is not None:
-                metrics["encoder_grad_norm"] = _grad_norm(self.encoder.parameters())
                 if self.cfg.obs_type == "vit":
                     metrics["encoder_lr_backbone"] = self.encoder_opt.param_groups[0]["lr"]
                     metrics["encoder_lr_projector"] = self.encoder_opt.param_groups[1]["lr"]
                 else:
                     metrics["encoder_lr"] = self.encoder_opt.param_groups[0]["lr"]
+            if idm_prediction is not None:
+                with torch.no_grad():
+                    prediction_error = idm_prediction - action
+                    action_var = action.var(dim=0, unbiased=False).mean()
+                    prediction_var = idm_prediction.var(dim=0, unbiased=False).mean()
+                    error_var = prediction_error.var(dim=0, unbiased=False).mean()
+                    eps = 1e-12
+                    metrics["idm_action_mae"] = prediction_error.abs().mean().item()
+                    metrics["idm_nmse"] = (idm_loss / (action_var + eps)).item()
+                    metrics["idm_explained_variance"] = (
+                        1.0 - error_var / (action_var + eps)
+                    ).item()
+                    metrics["action_std"] = action_var.sqrt().item()
+                    metrics["idm_pred_std"] = prediction_var.sqrt().item()
+                    metrics["h_norm"] = 0.5 * (
+                        obs.norm(dim=-1).mean() + next_obs.norm(dim=-1).mean()
+                    ).item()
+                    metrics["delta_h_norm"] = (next_obs - obs).norm(dim=-1).mean().item()
 
         # optimize FB
         if self.encoder_opt is not None:
@@ -663,7 +773,58 @@ class FBDDPGAgent:
         if self.idm_optimizer is not None:
             self.idm_optimizer.zero_grad(set_to_none=True)
         self.fb_opt.zero_grad(set_to_none=True)
+
+        encoder_parameters = tuple(self.encoder.parameters())
+        diagnostics_due = (
+            logging_enabled
+            and self.idm_head is not None
+            and (
+                self._idm_diagnostics_pending
+                or self._idm_update_count % self.cfg.idm_diagnostics_interval == 0
+            )
+        )
+        fb_encoder_grads: tp.Tuple[tp.Optional[torch.Tensor], ...] = ()
+        idm_encoder_grads: tp.Tuple[tp.Optional[torch.Tensor], ...] = ()
+        if diagnostics_due and encoder_parameters:
+            fb_encoder_grads = torch.autograd.grad(
+                fb_loss,
+                encoder_parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            idm_encoder_grads = torch.autograd.grad(
+                idm_loss,
+                encoder_parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+
+        # This remains the one and only training backward.  Functional
+        # diagnostic gradients above never populate or modify parameter.grad.
         total_loss.backward()
+        if logging_enabled and self.encoder_opt is not None:
+            # Current-batch gradient, deliberately measured after backward and
+            # before clipping/optimizer.step().
+            metrics["encoder_grad_norm"] = _grad_norm(encoder_parameters)
+        if diagnostics_due:
+            fb_grad_norm = _tensor_grad_norm(fb_encoder_grads)
+            idm_grad_norm = _tensor_grad_norm(idm_encoder_grads)
+            weighted_idm_grad_norm = self.cfg.idm_coef * idm_grad_norm
+            weighted_dot = self.cfg.idm_coef * _tensor_grad_dot(
+                fb_encoder_grads, idm_encoder_grads
+            )
+            total_grad_norm = _grad_norm(encoder_parameters)
+            eps = 1e-12
+            metrics["encoder_grad_norm_fb"] = fb_grad_norm
+            metrics["encoder_grad_norm_idm_unweighted"] = idm_grad_norm
+            metrics["encoder_grad_norm_idm_weighted"] = weighted_idm_grad_norm
+            metrics["encoder_grad_norm_total"] = total_grad_norm
+            metrics["encoder_grad_ratio_idm_fb"] = weighted_idm_grad_norm / (fb_grad_norm + eps)
+            metrics["encoder_grad_cosine_fb_idm"] = weighted_dot / (
+                fb_grad_norm * weighted_idm_grad_norm + eps
+            )
+            assert self.idm_head is not None
+            metrics["idm_head_grad_norm"] = _grad_norm(self.idm_head.parameters())
         if self.cfg.obs_type == "vit" and self.encoder_opt is not None and self.cfg.update_encoder and self.cfg.vit_encoder_grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.cfg.vit_encoder_grad_clip)
         self.fb_opt.step()
@@ -675,19 +836,31 @@ class FBDDPGAgent:
             self.idm_optimizer.step()
         if self.encoder_scheduler is not None and self.cfg.update_encoder:
             self.encoder_scheduler.step()
+        if diagnostics_due:
+            self._idm_diagnostics_pending = False
+        self._idm_update_count += 1
         return metrics
+
+    def _predict_idm_action(
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.idm_head is None:
+            raise RuntimeError("Cannot predict with IDM when idm_coef is zero")
+        return self.idm_head(torch.cat([obs, next_obs], dim=-1))
 
     def _compute_idm_loss(
         self,
         obs: torch.Tensor,
         next_obs: torch.Tensor,
         action: torch.Tensor,
+        prediction: tp.Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict the transition action from consecutive online features."""
-        if self.idm_head is None:
-            raise RuntimeError("Cannot compute IDM loss when idm_coef is zero")
-        idm_input = torch.cat([obs, next_obs], dim=-1)
-        return F.mse_loss(self.idm_head(idm_input), action)
+        if prediction is None:
+            prediction = self._predict_idm_action(obs, next_obs)
+        return F.mse_loss(prediction, action)
 
     def update_actor(self, obs: torch.Tensor, z: torch.Tensor, step: int) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
