@@ -716,6 +716,28 @@ class FBDDPGAgent:
 
         logging_enabled = self.cfg.use_tb or self.cfg.use_wandb or self.cfg.use_hiplog
         if logging_enabled:
+            # These are the exact online F/M tensors used above by the FB loss.
+            # Aggregate twin-F statistics treat the two branches as one set of
+            # batch rows; no surrogate forward pass is used for diagnostics.
+            F1_detached, F2_detached = F1.detach(), F2.detach()
+            F1_norms = F1_detached.norm(dim=-1)
+            F2_norms = F2_detached.norm(dim=-1)
+            F_norms = torch.cat((F1_norms, F2_norms))
+            metrics['F1_norm_mean'] = F1_norms.mean().item()
+            metrics['F2_norm_mean'] = F2_norms.mean().item()
+            metrics['F_norm_mean'] = F_norms.mean().item()
+            metrics['F1_norm_max'] = F1_norms.max().item()
+            metrics['F2_norm_max'] = F2_norms.max().item()
+            metrics['F_norm_max'] = F_norms.max().item()
+            metrics['F1_abs_max'] = F1_detached.abs().max().item()
+            metrics['F2_abs_max'] = F2_detached.abs().max().item()
+            metrics['F_abs_max'] = max(
+                metrics['F1_abs_max'], metrics['F2_abs_max']
+            )
+            metrics['M_online_abs_max'] = max(
+                M1.detach().abs().max().item(),
+                M2.detach().abs().max().item(),
+            )
             metrics['target_M'] = target_M.mean().item()
             metrics['M1'] = M1.mean().item()
             metrics['F1'] = F1.mean().item()
@@ -802,6 +824,13 @@ class FBDDPGAgent:
         # This remains the one and only training backward.  Functional
         # diagnostic gradients above never populate or modify parameter.grad.
         total_loss.backward()
+        if logging_enabled:
+            # Read the gradients that the optimizer will actually apply. The
+            # aggregate covers the shared ForwardMap trunk exactly once; the
+            # split metrics cover each twin F head's exclusive parameters.
+            metrics['F1_grad_norm'] = _grad_norm(self.forward_net.F1.parameters())
+            metrics['F2_grad_norm'] = _grad_norm(self.forward_net.F2.parameters())
+            metrics['F_grad_norm'] = _grad_norm(self.forward_net.parameters())
         if logging_enabled and self.encoder_opt is not None:
             # Current-batch gradient, deliberately measured after backward and
             # before clipping/optimizer.step().

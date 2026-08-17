@@ -93,6 +93,7 @@ class Config:
                                        2000000, 3000000, 4000000, 5000000, 9000000, 10000000)
     checkpoint_every: int = 100000
     load_model: tp.Optional[str] = None
+    auto_resume: bool = True
     checkpoint_root: tp.Optional[str] = "/mnt/data_7tb/fanfeng/controallable_agent_ckpt"
     save_replay_buffer_in_checkpoint: bool = False
     # training
@@ -162,7 +163,7 @@ def _init_wandb(cfg: tp.Any, exp_name: str) -> None:
     wandb.init(
         project=wandb_project,
         group=cfg.agent.name,
-        name=exp_name,
+        name=os.environ.get("WANDB_RUN_NAME", exp_name),
         config=omgcf.OmegaConf.to_container(
             cfg, resolve=True, throw_on_missing=True
         ),
@@ -392,10 +393,11 @@ class BaseWorkspace(tp.Generic[C]):
         self._legacy_checkpoint_filepath = self.work_dir / "models" / "latest.pt"
         self._checkpoint_filepath = self._checkpoint_path_for(self.work_dir, cfg.checkpoint_root)
         self._resume_checkpoint_filepath: tp.Optional[Path] = None
-        for candidate in (self._checkpoint_filepath, self._legacy_checkpoint_filepath):
-            if candidate.exists():
-                self._resume_checkpoint_filepath = candidate
-                break
+        if cfg.auto_resume:
+            for candidate in (self._checkpoint_filepath, self._legacy_checkpoint_filepath):
+                if candidate.exists():
+                    self._resume_checkpoint_filepath = candidate
+                    break
         if self._resume_checkpoint_filepath is not None:
             self.load_checkpoint(self._resume_checkpoint_filepath)
         elif cfg.load_model is not None:
