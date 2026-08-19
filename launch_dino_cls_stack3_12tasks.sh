@@ -16,6 +16,14 @@ AGENT_LR="${AGENT_LR:-0.0001}"
 IDM_COEF="${IDM_COEF:-0.0}"
 IDM_LR="${IDM_LR:-}"
 IDM_DIAGNOSTICS_INTERVAL="${IDM_DIAGNOSTICS_INTERVAL:-500}"
+IDM_ENCODER_MODE="${IDM_ENCODER_MODE:-legacy}"
+IDM_ENCODER_BURNIN_STEPS="${IDM_ENCODER_BURNIN_STEPS:-0}"
+IDM_ENCODER_RAMP_STEPS="${IDM_ENCODER_RAMP_STEPS:-0}"
+IDM_GRAD_RATIO_TARGET="${IDM_GRAD_RATIO_TARGET:-}"
+IDM_GRAD_RATIO_EMA="${IDM_GRAD_RATIO_EMA:-0.9}"
+IDM_COEF_MIN="${IDM_COEF_MIN:-0.1}"
+IDM_COEF_MAX="${IDM_COEF_MAX:-200.0}"
+IDM_COEF_SLEW_RATE="${IDM_COEF_SLEW_RATE:-2.0}"
 STAGE="${STAGE:-}"
 TIMESTAMP="${TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)_dino_cls_stack3}"
 PARALLEL_TASKS="${PARALLEL_TASKS:-0}"
@@ -73,8 +81,16 @@ Environment overrides:
   IDM_COEF=0.0               Inverse-dynamics auxiliary coefficient.
   IDM_LR=                    Separate IDM-head LR. Empty uses AGENT_LR.
   IDM_DIAGNOSTICS_INTERVAL=500
-                             Expensive component-gradient logging interval,
-                             counted in optimizer updates.
+                             Component-gradient logging interval and, in
+                             balanced mode, rebalance interval (optimizer updates).
+  IDM_ENCODER_MODE=legacy    legacy, static encoder-only, or balanced.
+  IDM_ENCODER_BURNIN_STEPS=0 Environment steps that train only the IDM head.
+  IDM_ENCODER_RAMP_STEPS=0   Static-mode linear ramp after burn-in.
+  IDM_GRAD_RATIO_TARGET=     Required in balanced mode, e.g. 0.01 or 0.05.
+  IDM_GRAD_RATIO_EMA=0.9
+  IDM_COEF_MIN=0.1
+  IDM_COEF_MAX=200.0
+  IDM_COEF_SLEW_RATE=2.0
   WANDB_PROJECT=controllable_agent_baseline
   REPO_DIR, TRAIN_SCRIPT, RUNS_DIR, CKPT_ROOT, LAUNCH_ROOT, TIMESTAMP
 
@@ -115,6 +131,20 @@ if [[ ! "$IDM_DIAGNOSTICS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
   echo "IDM_DIAGNOSTICS_INTERVAL must be a positive integer, got: $IDM_DIAGNOSTICS_INTERVAL" >&2
   exit 2
 fi
+if [[ "$IDM_ENCODER_MODE" != "legacy" \
+      && "$IDM_ENCODER_MODE" != "static" \
+      && "$IDM_ENCODER_MODE" != "balanced" ]]; then
+  echo "IDM_ENCODER_MODE must be legacy, static, or balanced, got: $IDM_ENCODER_MODE" >&2
+  exit 2
+fi
+if [[ ! "$IDM_ENCODER_BURNIN_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "IDM_ENCODER_BURNIN_STEPS must be a non-negative integer, got: $IDM_ENCODER_BURNIN_STEPS" >&2
+  exit 2
+fi
+if [[ ! "$IDM_ENCODER_RAMP_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "IDM_ENCODER_RAMP_STEPS must be a non-negative integer, got: $IDM_ENCODER_RAMP_STEPS" >&2
+  exit 2
+fi
 if [[ ! "$EVAL_EVERY_FRAMES" =~ ^[1-9][0-9]*$ ]]; then
   echo "EVAL_EVERY_FRAMES must be a positive integer, got: $EVAL_EVERY_FRAMES" >&2
   exit 2
@@ -135,6 +165,54 @@ if [[ -n "$IDM_LR" ]] && ! is_positive_number "$IDM_LR"; then
   echo "IDM_LR must be empty or a positive number, got: $IDM_LR" >&2
   exit 2
 fi
+if ! is_nonnegative_number "$IDM_GRAD_RATIO_EMA" \
+    || ! awk -v value="$IDM_GRAD_RATIO_EMA" 'BEGIN { exit !(value + 0 < 1) }'; then
+  echo "IDM_GRAD_RATIO_EMA must be in [0, 1), got: $IDM_GRAD_RATIO_EMA" >&2
+  exit 2
+fi
+if ! is_positive_number "$IDM_COEF_MIN"; then
+  echo "IDM_COEF_MIN must be a positive number, got: $IDM_COEF_MIN" >&2
+  exit 2
+fi
+if ! is_positive_number "$IDM_COEF_MAX" \
+    || ! awk -v low="$IDM_COEF_MIN" -v high="$IDM_COEF_MAX" 'BEGIN { exit !(high + 0 >= low + 0) }'; then
+  echo "IDM_COEF_MAX must be at least IDM_COEF_MIN, got: $IDM_COEF_MAX" >&2
+  exit 2
+fi
+if ! is_positive_number "$IDM_COEF_SLEW_RATE" \
+    || ! awk -v value="$IDM_COEF_SLEW_RATE" 'BEGIN { exit !(value + 0 >= 1) }'; then
+  echo "IDM_COEF_SLEW_RATE must be at least 1, got: $IDM_COEF_SLEW_RATE" >&2
+  exit 2
+fi
+if [[ "$IDM_ENCODER_MODE" == "legacy" ]]; then
+  if [[ "$IDM_ENCODER_BURNIN_STEPS" != "0" || "$IDM_ENCODER_RAMP_STEPS" != "0" \
+        || -n "$IDM_GRAD_RATIO_TARGET" ]]; then
+    echo "IDM encoder scheduling requires IDM_ENCODER_MODE=static or balanced." >&2
+    exit 2
+  fi
+elif ! is_positive_number "$IDM_COEF"; then
+  echo "IDM_ENCODER_MODE=$IDM_ENCODER_MODE requires a positive IDM_COEF." >&2
+  exit 2
+elif [[ "$IDM_ENCODER_MODE" == "static" ]]; then
+  if [[ -n "$IDM_GRAD_RATIO_TARGET" ]]; then
+    echo "IDM_GRAD_RATIO_TARGET is valid only in balanced mode." >&2
+    exit 2
+  fi
+else
+  if ! is_positive_number "$IDM_GRAD_RATIO_TARGET"; then
+    echo "IDM_ENCODER_MODE=balanced requires a positive IDM_GRAD_RATIO_TARGET." >&2
+    exit 2
+  fi
+  if [[ "$IDM_ENCODER_RAMP_STEPS" != "0" ]]; then
+    echo "Balanced mode does not use IDM_ENCODER_RAMP_STEPS." >&2
+    exit 2
+  fi
+  if ! awk -v coef="$IDM_COEF" -v low="$IDM_COEF_MIN" -v high="$IDM_COEF_MAX" \
+      'BEGIN { exit !(coef + 0 >= low + 0 && coef + 0 <= high + 0) }'; then
+    echo "Balanced IDM_COEF must be within [IDM_COEF_MIN, IDM_COEF_MAX]." >&2
+    exit 2
+  fi
+fi
 if [[ -n "$STAGE" && ! "$STAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "STAGE must contain only letters, digits, '.', '_' or '-', got: $STAGE" >&2
   exit 2
@@ -154,6 +232,19 @@ if [[ -n "$STAGE" ]] || awk -v value="$IDM_COEF" 'BEGIN { exit !(value + 0 > 0) 
   if [[ -n "$IDM_LR" ]]; then
     idm_lr_label="${IDM_LR//./p}"
     IDM_SUFFIX+="_idmlr${idm_lr_label}"
+  fi
+fi
+if [[ "$IDM_ENCODER_MODE" != "legacy" ]]; then
+  IDM_SUFFIX+="_enc${IDM_ENCODER_MODE}_b${IDM_ENCODER_BURNIN_STEPS}"
+  if [[ "$IDM_ENCODER_MODE" == "static" ]]; then
+    IDM_SUFFIX+="_r${IDM_ENCODER_RAMP_STEPS}"
+  else
+    ratio_label="${IDM_GRAD_RATIO_TARGET//./p}"
+    min_label="${IDM_COEF_MIN//./p}"
+    max_label="${IDM_COEF_MAX//./p}"
+    ema_label="${IDM_GRAD_RATIO_EMA//./p}"
+    slew_label="${IDM_COEF_SLEW_RATE//./p}"
+    IDM_SUFFIX+="_rho${ratio_label}_i${IDM_DIAGNOSTICS_INTERVAL}_c${min_label}-${max_label}_ema${ema_label}_slew${slew_label}"
   fi
 fi
 
@@ -359,8 +450,8 @@ write_job_script() {
     printf 'cd %q\n' "$REPO_DIR"
     printf 'run_dir=%q\n' "$run_dir"
     printf 'mkdir -p "$run_dir"\n'
-    printf 'echo "[start] $(date -u +%%FT%%TZ) task=%s seed=%s gpu=%s stage=%s dino_frame_stack=3 idm_coef=%s idm_lr=%s idm_diagnostics_interval=%s num_train_frames=%s resume=%s" | tee -a "$run_dir/launcher.log"\n' \
-      "$task" "$SEED" "$gpu" "${STAGE:-unspecified}" "$IDM_COEF" "$EFFECTIVE_IDM_LR" "$IDM_DIAGNOSTICS_INTERVAL" "$NUM_TRAIN_FRAMES" "$RESUME"
+    printf 'echo "[start] $(date -u +%%FT%%TZ) task=%s seed=%s gpu=%s stage=%s dino_frame_stack=3 idm_coef=%s idm_lr=%s idm_encoder_mode=%s idm_encoder_burnin_steps=%s idm_encoder_ramp_steps=%s idm_grad_ratio_target=%s num_train_frames=%s resume=%s" | tee -a "$run_dir/launcher.log"\n' \
+      "$task" "$SEED" "$gpu" "${STAGE:-unspecified}" "$IDM_COEF" "$EFFECTIVE_IDM_LR" "$IDM_ENCODER_MODE" "$IDM_ENCODER_BURNIN_STEPS" "$IDM_ENCODER_RAMP_STEPS" "${IDM_GRAD_RATIO_TARGET:-none}" "$NUM_TRAIN_FRAMES" "$RESUME"
     printf 'if env CUDA_VISIBLE_DEVICES=%q PYTHONUNBUFFERED=1 WANDB_PROJECT=%q WANDB_RUN_ID=%q WANDB_RESUME=%q python %q ' \
       "$gpu" "$WANDB_PROJECT" "$wandb_run_id" "$wandb_resume" "$TRAIN_SCRIPT"
     printf '%q ' \
@@ -385,6 +476,14 @@ write_job_script() {
       "agent.idm_coef=$IDM_COEF" \
       "agent.idm_lr=${IDM_LR:-null}" \
       "agent.idm_diagnostics_interval=$IDM_DIAGNOSTICS_INTERVAL" \
+      "agent.idm_encoder_mode=$IDM_ENCODER_MODE" \
+      "agent.idm_encoder_burnin_steps=$IDM_ENCODER_BURNIN_STEPS" \
+      "agent.idm_encoder_ramp_steps=$IDM_ENCODER_RAMP_STEPS" \
+      "agent.idm_grad_ratio_target=${IDM_GRAD_RATIO_TARGET:-null}" \
+      "agent.idm_grad_ratio_ema=$IDM_GRAD_RATIO_EMA" \
+      "agent.idm_coef_min=$IDM_COEF_MIN" \
+      "agent.idm_coef_max=$IDM_COEF_MAX" \
+      "agent.idm_coef_slew_rate=$IDM_COEF_SLEW_RATE" \
       "agent.batch_size=1024" \
       "agent.update_every_steps=2" \
       "update_encoder=True" \
@@ -441,7 +540,7 @@ session_for_task() {
 }
 
 mkdir -p "$launch_dir"
-printf 'session\tgpu\tseed\ttask\tgoal_space\trun_dir\tstdout_log\tdomain\tidm_coef\tidm_lr\tidm_diagnostics_interval\tnum_train_frames\teval_every_frames\tstage\tresume\twandb_run_id\tlaunch_mode\tjob_file\tsession_log\n' > "$manifest"
+printf 'session\tgpu\tseed\ttask\tgoal_space\trun_dir\tstdout_log\tdomain\tidm_coef\tidm_lr\tidm_diagnostics_interval\tidm_encoder_mode\tidm_encoder_burnin_steps\tidm_encoder_ramp_steps\tidm_grad_ratio_target\tidm_grad_ratio_ema\tidm_coef_min\tidm_coef_max\tidm_coef_slew_rate\tnum_train_frames\teval_every_frames\tstage\tresume\twandb_run_id\tlaunch_mode\tjob_file\tsession_log\n' > "$manifest"
 
 if [[ "$PARALLEL_TASKS" -eq 0 ]]; then
   for gpu in "${USED_GPU_ORDER[@]}"; do
@@ -469,9 +568,10 @@ for ordinal in "${!SELECTED_TASKS[@]}"; do
     launch_mode="serial_gpu_queue"
     session_log="$launch_dir/queue_gpu${gpu}.log"
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$session" "$gpu" "$SEED" "$task" "$goal_space" "$run_dir" "$run_dir/stdout.log" \
-    "$domain" "$IDM_COEF" "$EFFECTIVE_IDM_LR" "$IDM_DIAGNOSTICS_INTERVAL" "$NUM_TRAIN_FRAMES" "$EVAL_EVERY_FRAMES" "${STAGE:-unspecified}" "$RESUME" "$wandb_run_id" \
+    "$domain" "$IDM_COEF" "$EFFECTIVE_IDM_LR" "$IDM_DIAGNOSTICS_INTERVAL" "$IDM_ENCODER_MODE" "$IDM_ENCODER_BURNIN_STEPS" "$IDM_ENCODER_RAMP_STEPS" "${IDM_GRAD_RATIO_TARGET:-}" "$IDM_GRAD_RATIO_EMA" "$IDM_COEF_MIN" "$IDM_COEF_MAX" "$IDM_COEF_SLEW_RATE" \
+    "$NUM_TRAIN_FRAMES" "$EVAL_EVERY_FRAMES" "${STAGE:-unspecified}" "$RESUME" "$wandb_run_id" \
     "$launch_mode" "$job_file" "$session_log" \
     >> "$manifest"
   printf '%s\t%s\t%s\t%s\n' "$session" "$gpu" "$task" "$run_dir"

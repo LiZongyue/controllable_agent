@@ -89,6 +89,24 @@ def test_idm_hydra_config_wiring() -> None:
     assert cfg.agent.idm_lr is None
     _validate_idm_training_config(cfg)
 
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        balanced = compose(
+            config_name="base_config",
+            overrides=[
+                "obs_type=dino",
+                "use_cls=true",
+                "dino_frame_stack=3",
+                "agent.idm_coef=1.0",
+                "agent.idm_encoder_mode=balanced",
+                "agent.idm_encoder_burnin_steps=25000",
+                "agent.idm_grad_ratio_target=0.01",
+            ],
+        )
+    assert balanced.agent.idm_encoder_mode == "balanced"
+    assert balanced.agent.idm_encoder_burnin_steps == 25000
+    assert balanced.agent.idm_grad_ratio_target == 0.01
+    _validate_idm_training_config(balanced)
+
 
 def test_wandb_init_uses_stable_id_and_explicit_frame_axes() -> None:
     cfg = SimpleNamespace(agent=SimpleNamespace(name="fb_ddpg"))

@@ -73,6 +73,14 @@ def _run_launcher(
             "IDM_COEF": "0.0",
             "IDM_LR": "",
             "IDM_DIAGNOSTICS_INTERVAL": "500",
+            "IDM_ENCODER_MODE": "legacy",
+            "IDM_ENCODER_BURNIN_STEPS": "0",
+            "IDM_ENCODER_RAMP_STEPS": "0",
+            "IDM_GRAD_RATIO_TARGET": "",
+            "IDM_GRAD_RATIO_EMA": "0.9",
+            "IDM_COEF_MIN": "0.1",
+            "IDM_COEF_MAX": "200.0",
+            "IDM_COEF_SLEW_RATE": "2.0",
             "NUM_TRAIN_FRAMES": "2000010",
         }
     )
@@ -288,6 +296,93 @@ def test_full_12_task_parallel_dry_run_uses_independent_sessions_and_10k_eval(
         assert "num_train_frames=500000" in job_text
 
 
+def test_balanced_idm_encoder_settings_have_stable_identity_and_wiring(
+    tmp_path: Path,
+) -> None:
+    _, launch_root, _, _, tmux_marker = _run_launcher(
+        tmp_path,
+        root_name="balanced",
+        timestamp="pilot",
+        overrides={
+            "TASKS": "walker_flip cheetah_walk quadruped_walk",
+            "GPU_ASSIGNMENTS": "2 4 6",
+            "STAGE": "rho1pct",
+            "IDM_COEF": "1.0",
+            "IDM_LR": "0.0001",
+            "IDM_ENCODER_MODE": "balanced",
+            "IDM_ENCODER_BURNIN_STEPS": "25000",
+            "IDM_GRAD_RATIO_TARGET": "0.01",
+            "NUM_TRAIN_FRAMES": "500000",
+        },
+        extra_args=("--parallel",),
+    )
+    launch_dir = launch_root / (
+        "pilot_rho1pct_idm1p0_idmlr0p0001_encbalanced_b25000_"
+        "rho0p01_i500_c0p1-200p0_ema0p9_slew2p0_f500000"
+    )
+    rows = _read_manifest(launch_dir)
+    assert len(rows) == 3
+    assert [row["gpu"] for row in rows] == ["2", "4", "6"]
+    assert {row["idm_encoder_mode"] for row in rows} == {"balanced"}
+    assert {row["idm_encoder_burnin_steps"] for row in rows} == {"25000"}
+    assert {row["idm_grad_ratio_target"] for row in rows} == {"0.01"}
+    for row in rows:
+        job_text = Path(row["job_file"]).read_text()
+        assert "agent.idm_encoder_mode=balanced" in job_text
+        assert "agent.idm_encoder_burnin_steps=25000" in job_text
+        assert "agent.idm_grad_ratio_target=0.01" in job_text
+    assert not tmux_marker.exists()
+
+
+def test_gradient_pilot_prepares_three_tasks_by_four_settings_without_launch(
+    tmp_path: Path,
+) -> None:
+    repo_dir = Path(__file__).parents[1]
+    launch_root = tmp_path / "pilot-launches"
+    env = os.environ.copy()
+    env.update(
+        {
+            "REPO_DIR": str(repo_dir),
+            "BASE_LAUNCHER": str(repo_dir / "launch_dino_cls_stack3_12tasks.sh"),
+            "RUNS_DIR": str(tmp_path / "pilot-runs"),
+            "CKPT_ROOT": str(tmp_path / "pilot-checkpoints"),
+            "LAUNCH_ROOT": str(launch_root),
+            "TIMESTAMP": "pilot-grid",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(repo_dir / "launch_idm_gradient_pilot.sh")],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert "no tmux sessions were launched" in result.stdout
+
+    with (launch_root / "pilot-grid_pilot_index" / "manifests.tsv").open(
+        newline=""
+    ) as stream:
+        index_rows = list(csv.DictReader(stream, delimiter="\t"))
+    assert [row["setting"] for row in index_rows] == [
+        "static1",
+        "static10",
+        "rho1pct",
+        "rho5pct",
+    ]
+    task_rows = []
+    for index_row in index_rows:
+        with Path(index_row["manifest"]).open(newline="") as stream:
+            task_rows.extend(csv.DictReader(stream, delimiter="\t"))
+    assert len(task_rows) == 12
+    assert {row["task"] for row in task_rows} == {
+        "walker_flip",
+        "cheetah_walk",
+        "quadruped_walk",
+    }
+    assert {row["seed"] for row in task_rows} == {"1"}
+
+
 def test_parallel_tasks_environment_switch_is_supported(tmp_path: Path) -> None:
     _, launch_root, _, _, tmux_marker = _run_launcher(
         tmp_path,
@@ -425,6 +520,13 @@ def test_duplicate_gpu_tokens_are_rejected_before_launch(tmp_path: Path) -> None
             "0",
             "IDM_DIAGNOSTICS_INTERVAL must be a positive integer",
         ),
+        ("IDM_ENCODER_MODE", "adaptive", "IDM_ENCODER_MODE must be"),
+        (
+            "IDM_ENCODER_BURNIN_STEPS",
+            "-1",
+            "IDM_ENCODER_BURNIN_STEPS must be a non-negative integer",
+        ),
+        ("IDM_GRAD_RATIO_EMA", "1", "IDM_GRAD_RATIO_EMA must be in [0, 1)"),
     ],
 )
 def test_invalid_numeric_settings_are_rejected_before_launch(

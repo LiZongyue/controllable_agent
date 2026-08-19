@@ -131,13 +131,22 @@ def _validate_idm_training_config(cfg: tp.Any) -> None:
     """Keep the IDM auxiliary on the three-frame DINO CLS FB variant."""
     idm_coef = float(getattr(cfg.agent, "idm_coef", 0.0))
     idm_lr = getattr(cfg.agent, "idm_lr", None)
+    idm_encoder_mode = str(getattr(cfg.agent, "idm_encoder_mode", "legacy"))
     if idm_coef < 0:
         raise ValueError("agent.idm_coef must be non-negative")
     if idm_lr is not None and float(idm_lr) <= 0:
         raise ValueError("agent.idm_lr must be positive when provided")
     if idm_coef > 0 and not bool(getattr(cfg, "update_encoder", False)):
         raise ValueError("agent.idm_coef > 0 requires update_encoder=True")
-    if (idm_coef != 0 or idm_lr is not None) and (
+    idm_configured = (
+        idm_coef != 0
+        or idm_lr is not None
+        or idm_encoder_mode != "legacy"
+        or int(getattr(cfg.agent, "idm_encoder_burnin_steps", 0)) != 0
+        or int(getattr(cfg.agent, "idm_encoder_ramp_steps", 0)) != 0
+        or getattr(cfg.agent, "idm_grad_ratio_target", None) is not None
+    )
+    if idm_configured and (
         getattr(cfg.agent, "name", None) != "fb_ddpg"
         or cfg.obs_type != "dino"
         or not cfg.use_cls

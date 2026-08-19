@@ -25,6 +25,14 @@ def _make_agent(
     idm_lr=None,
     goal_space=None,
     idm_diagnostics_interval=500,
+    idm_encoder_mode="legacy",
+    idm_encoder_burnin_steps=0,
+    idm_encoder_ramp_steps=0,
+    idm_grad_ratio_target=None,
+    idm_grad_ratio_ema=0.9,
+    idm_coef_min=0.1,
+    idm_coef_max=200.0,
+    idm_coef_slew_rate=2.0,
     update_encoder=True,
     logging_enabled=True,
     lr=1e-4,
@@ -49,6 +57,14 @@ def _make_agent(
         z_dim=4,
         dino_adapter_output_dim=4,
         idm_diagnostics_interval=idm_diagnostics_interval,
+        idm_encoder_mode=idm_encoder_mode,
+        idm_encoder_burnin_steps=idm_encoder_burnin_steps,
+        idm_encoder_ramp_steps=idm_encoder_ramp_steps,
+        idm_grad_ratio_target=idm_grad_ratio_target,
+        idm_grad_ratio_ema=idm_grad_ratio_ema,
+        idm_coef_min=idm_coef_min,
+        idm_coef_max=idm_coef_max,
+        idm_coef_slew_rate=idm_coef_slew_rate,
     )
     if idm_coef is not _OMITTED:
         kwargs["idm_coef"] = idm_coef
@@ -67,7 +83,7 @@ def _fixed_batch():
     return raw_obs, raw_next_obs, action, discount, z
 
 
-def _update_fb(agent: fb_ddpg.FBDDPGAgent, batch, seed: int = 99):
+def _update_fb(agent: fb_ddpg.FBDDPGAgent, batch, seed: int = 99, step: int = 0):
     raw_obs, raw_next_obs, action, discount, z = batch
     obs = agent.aug_and_encode(raw_obs)
     next_obs = agent.aug_and_encode(raw_next_obs)
@@ -80,7 +96,7 @@ def _update_fb(agent: fb_ddpg.FBDDPGAgent, batch, seed: int = 99):
         next_goal=next_obs,
         target_next_goal=next_obs.detach(),
         z=z,
-        step=0,
+        step=step,
     )
 
 
@@ -149,6 +165,138 @@ def test_idm_config_validation_and_learning_rate() -> None:
         for parameter in group["params"]
     }
     assert idm_parameter_ids.isdisjoint(other_parameter_ids)
+
+
+def test_idm_encoder_mode_validation_and_schedule() -> None:
+    with pytest.raises(ValueError, match="idm_encoder_mode"):
+        _make_agent(idm_coef=1.0, idm_encoder_mode="unknown")
+    with pytest.raises(ValueError, match="require idm_coef > 0"):
+        _make_agent(idm_coef=0.0, idm_encoder_mode="static")
+    with pytest.raises(ValueError, match="burn-in/ramp"):
+        _make_agent(idm_coef=0.1, idm_encoder_burnin_steps=1)
+    with pytest.raises(ValueError, match="finite positive idm_grad_ratio_target"):
+        _make_agent(idm_coef=1.0, idm_encoder_mode="balanced")
+    with pytest.raises(ValueError, match="does not use idm_encoder_ramp_steps"):
+        _make_agent(
+            idm_coef=1.0,
+            idm_encoder_mode="balanced",
+            idm_grad_ratio_target=0.01,
+            idm_encoder_ramp_steps=1,
+        )
+
+    static = _make_agent(
+        idm_coef=10.0,
+        idm_encoder_mode="static",
+        idm_encoder_burnin_steps=5,
+        idm_encoder_ramp_steps=10,
+    )
+    assert static._idm_encoder_coefficient(4) == 0.0  # pylint: disable=protected-access
+    assert static._idm_encoder_coefficient(5) == 0.0  # pylint: disable=protected-access
+    assert static._idm_encoder_coefficient(10) == 5.0  # pylint: disable=protected-access
+    assert static._idm_encoder_coefficient(15) == 10.0  # pylint: disable=protected-access
+
+
+def test_encoder_only_mode_scales_encoder_but_not_idm_head_gradient() -> None:
+    torch.manual_seed(41)
+    unit = _make_agent(idm_coef=1.0, idm_encoder_mode="static")
+    torch.manual_seed(41)
+    scaled = _make_agent(idm_coef=10.0, idm_encoder_mode="static")
+    assert unit.idm_head is not None and scaled.idm_head is not None
+    _assert_module_equal(unit.encoder, scaled.encoder)
+    _assert_module_equal(unit.idm_head, scaled.idm_head)
+
+    raw_obs, raw_next_obs, action, _, _ = _fixed_batch()
+
+    def idm_gradients(agent):
+        obs = agent.aug_and_encode(raw_obs)
+        next_obs = agent.aug_and_encode(raw_next_obs)
+        coefficient = agent._idm_encoder_coefficient(0)  # pylint: disable=protected-access
+        idm_obs = fb_ddpg._scale_idm_encoder_gradient(obs, coefficient)
+        idm_next_obs = fb_ddpg._scale_idm_encoder_gradient(next_obs, coefficient)
+        loss = agent._compute_idm_loss(  # pylint: disable=protected-access
+            idm_obs,
+            idm_next_obs,
+            action,
+        )
+        loss.backward()
+        encoder_grads = tuple(parameter.grad for parameter in agent.encoder.parameters())
+        head_grads = tuple(parameter.grad for parameter in agent.idm_head.parameters())
+        return loss.detach(), encoder_grads, head_grads
+
+    unit_loss, unit_encoder_grads, unit_head_grads = idm_gradients(unit)
+    scaled_loss, scaled_encoder_grads, scaled_head_grads = idm_gradients(scaled)
+    torch.testing.assert_close(unit_loss, scaled_loss, rtol=0, atol=0)
+    for unit_grad, scaled_grad in zip(unit_head_grads, scaled_head_grads):
+        torch.testing.assert_close(unit_grad, scaled_grad, rtol=0, atol=0)
+    for unit_grad, scaled_grad in zip(unit_encoder_grads, scaled_encoder_grads):
+        torch.testing.assert_close(scaled_grad, 10.0 * unit_grad)
+
+
+def test_balanced_encoder_mode_hits_target_and_runs_without_logging() -> None:
+    kwargs = dict(
+        idm_coef=1.0,
+        idm_encoder_mode="balanced",
+        idm_grad_ratio_target=0.05,
+        idm_grad_ratio_ema=0.0,
+        idm_coef_min=1e-4,
+        idm_coef_max=1e4,
+        idm_coef_slew_rate=1e4,
+        idm_diagnostics_interval=1,
+    )
+    agent = _make_agent(**kwargs)
+    metrics = _update_fb(agent, _fixed_batch())
+    expected = (
+        agent.cfg.idm_grad_ratio_target
+        * metrics["encoder_grad_norm_fb"]
+        / (metrics["encoder_grad_norm_idm_unweighted"] + 1e-12)
+    )
+    assert metrics["idm_encoder_coef_used"] == 1.0
+    assert metrics["idm_weighted_loss"] == pytest.approx(metrics["idm_loss"])
+    assert metrics["total_loss"] == pytest.approx(
+        metrics["fb_loss"] + metrics["idm_weighted_loss"]
+    )
+    assert metrics["idm_encoder_coef_next"] == pytest.approx(expected)
+    assert agent._idm_effective_coef == pytest.approx(expected)  # pylint: disable=protected-access
+
+    silent = _make_agent(**kwargs, logging_enabled=False)
+    with mock.patch("torch.autograd.grad", wraps=torch.autograd.grad) as functional_grad:
+        silent_metrics = _update_fb(silent, _fixed_batch())
+    assert functional_grad.call_count == 2
+    assert silent_metrics == {}
+    assert silent._idm_effective_coef != 1.0  # pylint: disable=protected-access
+
+
+def test_encoder_only_burnin_reports_raw_gradient_while_encoder_weight_is_zero() -> None:
+    agent = _make_agent(
+        idm_coef=10.0,
+        idm_encoder_mode="static",
+        idm_encoder_burnin_steps=5,
+    )
+    metrics = _update_fb(agent, _fixed_batch())
+    assert metrics["idm_encoder_coef_used"] == 0.0
+    assert metrics["idm_weighted_loss"] == pytest.approx(metrics["idm_loss"])
+    assert metrics["idm_encoder_loss_proxy"] == 0.0
+    assert metrics["encoder_grad_norm_idm_unweighted"] > 0.0
+    assert metrics["encoder_grad_norm_idm_weighted"] == 0.0
+    assert metrics["encoder_grad_ratio_idm_fb"] == 0.0
+    assert metrics["idm_head_grad_norm"] > 0.0
+
+
+def test_balanced_burnin_keeps_coef_next_in_first_logger_schema() -> None:
+    agent = _make_agent(
+        idm_coef=1.0,
+        idm_encoder_mode="balanced",
+        idm_encoder_burnin_steps=5,
+        idm_grad_ratio_target=0.01,
+        idm_diagnostics_interval=1,
+    )
+    burnin_metrics = _update_fb(agent, _fixed_batch(), step=0)
+    assert burnin_metrics["idm_encoder_coef_used"] == 0.0
+    assert burnin_metrics["idm_encoder_coef_next"] == 1.0
+
+    balanced_metrics = _update_fb(agent, _fixed_batch(), step=5)
+    assert burnin_metrics.keys() == balanced_metrics.keys()
+    assert balanced_metrics["idm_encoder_coef_used"] == 1.0
 
 
 def test_zero_coef_is_a_strict_baseline_noop() -> None:
@@ -578,6 +726,50 @@ def test_idm_resume_forces_diagnostics_on_first_post_load_update() -> None:
     assert "encoder_grad_norm_fb" in metrics
     assert "encoder_grad_norm_idm_unweighted" in metrics
     assert not restored._idm_diagnostics_pending  # pylint: disable=protected-access
+
+
+def test_balanced_idm_resume_restores_controller_state_and_rejects_mismatch() -> None:
+    kwargs = dict(
+        idm_coef=1.0,
+        idm_encoder_mode="balanced",
+        idm_grad_ratio_target=0.01,
+        idm_diagnostics_interval=1,
+    )
+    source = _make_agent(**kwargs)
+    _update_fb(source, _fixed_batch())
+    restored = _make_agent(**kwargs)
+    restored.init_from(source)
+    assert restored._idm_update_count == source._idm_update_count  # pylint: disable=protected-access
+    assert restored._idm_effective_coef == source._idm_effective_coef  # pylint: disable=protected-access
+    assert restored._idm_fb_grad_norm_ema == source._idm_fb_grad_norm_ema  # pylint: disable=protected-access
+    assert restored._idm_raw_grad_norm_ema == source._idm_raw_grad_norm_ema  # pylint: disable=protected-access
+
+    continuation = _fixed_batch()
+    source_metrics = _update_fb(source, continuation, seed=123)
+    restored_metrics = _update_fb(restored, continuation, seed=123)
+    assert source_metrics == restored_metrics
+    for name in ("encoder", "forward_net", "backward_net", "idm_head"):
+        _assert_module_equal(getattr(source, name), getattr(restored, name))
+    for name in ("encoder_opt", "fb_opt", "idm_optimizer"):
+        _assert_nested_equal(
+            getattr(source, name).state_dict(),
+            getattr(restored, name).state_dict(),
+        )
+    assert restored._idm_effective_coef == source._idm_effective_coef  # pylint: disable=protected-access
+    assert restored._idm_fb_grad_norm_ema == source._idm_fb_grad_norm_ema  # pylint: disable=protected-access
+    assert restored._idm_raw_grad_norm_ema == source._idm_raw_grad_norm_ema  # pylint: disable=protected-access
+
+    mismatched = _make_agent(**{**kwargs, "idm_grad_ratio_target": 0.05})
+    encoder_before = copy.deepcopy(mismatched.encoder.state_dict())
+    with pytest.raises(ValueError, match="idm_grad_ratio_target"):
+        mismatched.init_from(source)
+    _assert_nested_equal(encoder_before, mismatched.encoder.state_dict())
+
+    malformed = _make_agent(**kwargs)
+    del malformed._idm_update_count  # pylint: disable=protected-access
+    destination = _make_agent(**kwargs)
+    with pytest.raises(ValueError, match="_idm_update_count"):
+        destination.init_from(malformed)
 
 
 @pytest.mark.parametrize("missing", ["idm_head", "idm_optimizer"])
