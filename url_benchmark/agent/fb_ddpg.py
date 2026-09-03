@@ -34,6 +34,12 @@ from .fb_modules import Actor, DiagGaussianActor, ForwardMap, BackwardMap, Onlin
 
 logger = logging.getLogger(__name__)
 VISUAL_ENCODER_OBS_TYPES = {"pixels", "dino", "vit"}
+IDM_ROUTES = {"none", "forward_adapter", "backward_adapter"}
+IDM_ROUTE_IDS = {
+    "none": 0.0,
+    "forward_adapter": 1.0,
+    "backward_adapter": 2.0,
+}
 
 
 def _warmup_cosine_scale(step: int, warmup_steps: int, decay_steps: int, min_scale: float) -> float:
@@ -101,6 +107,23 @@ def _effective_fb_lr(cfg: tp.Any) -> float:
     return float(cfg.lr if fb_lr is None else fb_lr)
 
 
+def _effective_forward_lr(cfg: tp.Any) -> float:
+    lr_f = getattr(cfg, "lr_f", None)
+    return _effective_fb_lr(cfg) if lr_f is None else float(lr_f)
+
+
+def _effective_backward_lr(cfg: tp.Any) -> float:
+    lr_b = getattr(cfg, "lr_b", None)
+    if lr_b is not None:
+        return float(lr_b)
+    return float(cfg.lr_coef) * _effective_fb_lr(cfg)
+
+
+def _effective_actor_lr(cfg: tp.Any) -> float:
+    lr_actor = getattr(cfg, "lr_actor", None)
+    return float(cfg.lr if lr_actor is None else lr_actor)
+
+
 def _scale_gradient(value: torch.Tensor, scale: float) -> torch.Tensor:
     """Preserve the forward value while scaling gradients to its producer."""
     if not 0.0 <= scale <= 1.0:
@@ -157,6 +180,48 @@ class ViTEncoder(nn.Module):
         return self.projector(pooled)
 
 
+class FlareBEncoder(nn.Module):
+    """Build the B-only FLARE representation from three raw DINO CLS frames."""
+
+    num_frames = 3
+    output_dim = 512
+
+    def __init__(self, frame_dim: int) -> None:
+        super().__init__()
+        self.frame_dim = frame_dim
+        self.projector = nn.Sequential(
+            nn.LayerNorm(frame_dim),
+            nn.Linear(frame_dim, self.output_dim),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(4 * self.output_dim, self.output_dim),
+            nn.LayerNorm(self.output_dim),
+        )
+
+    @staticmethod
+    def _assemble_flare(
+        u0: torch.Tensor,
+        u1: torch.Tensor,
+        u2: torch.Tensor,
+    ) -> torch.Tensor:
+        d1 = u1 - u0.detach()
+        d2 = u2 - u1.detach()
+        return torch.cat([u1, u2, d1, d2], dim=-1)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        expected_dim = self.num_frames * self.frame_dim
+        if obs.ndim != 2 or obs.shape[-1] != expected_dim:
+            raise ValueError(
+                "FLARE-B expects raw stacked DINO CLS embeddings with shape "
+                f"[B, {expected_dim}], got {tuple(obs.shape)}"
+            )
+        phi_0, phi_1, phi_2 = obs.split(self.frame_dim, dim=-1)
+        u0 = self.projector(phi_0)
+        u1 = self.projector(phi_1)
+        u2 = self.projector(phi_2)
+        return self.fusion(self._assemble_flare(u0, u1, u2))
+
+
 @dataclasses.dataclass
 class FBDDPGAgentConfig:
     # @package agent
@@ -169,6 +234,9 @@ class FBDDPGAgentConfig:
     device: str = omegaconf.II("device")  # ${device}
     lr: float = 1e-4
     fb_lr: tp.Optional[float] = None
+    lr_f: tp.Optional[float] = None
+    lr_b: tp.Optional[float] = None
+    lr_actor: tp.Optional[float] = None
     lr_coef: float = 1
     fb_target_tau: float = 0.01  # 0.001-0.01
     update_every_steps: int = 2
@@ -191,14 +259,23 @@ class FBDDPGAgentConfig:
     update_encoder: bool = omegaconf.II("update_encoder")  # ${update_encoder}
     goal_space: tp.Optional[str] = omegaconf.II("goal_space")
     use_cls: bool = omegaconf.II("use_cls")
+    dino_frame_stack: int = omegaconf.II("dino_frame_stack")
     dino_use_adapter: bool = True
     dino_adapter_type: str = "linear"
     dino_adapter_hidden_dim: int = 1024
     dino_adapter_output_dim: int = 512
+    pixel_separate_fb_encoders: bool = False
+    dino_separate_fb_adapters: bool = False
+    # Legacy experiment mode: a separate B adapter plus an EMA B adapter.
     dino_separate_backward_adapter: bool = False
+    dino_flare_b: bool = False
     backward_encoder_grad_scale: float = 1.0
     idm_coef: float = 0.0
     idm_lr: tp.Optional[float] = None
+    # ``none`` preserves the historical shared-encoder IDM path outside the
+    # explicit separate-F/B topology. Separate adapters require an explicit
+    # branch route whenever IDM is enabled.
+    idm_route: str = "none"
     idm_diagnostics_interval: int = 500  # also the balanced-mode update interval
     # ``legacy`` preserves the original loss weighting exactly. ``static``
     # trains the IDM head with the raw loss while applying ``idm_coef`` only
@@ -247,14 +324,109 @@ class FBDDPGAgent:
                  **kwargs: tp.Any
                  ):
         cfg = FBDDPGAgentConfig(**kwargs)
+        if cfg.dino_flare_b and cfg.dino_separate_backward_adapter:
+            raise ValueError(
+                "dino_flare_b and dino_separate_backward_adapter are mutually exclusive"
+            )
+        if cfg.dino_flare_b and (
+            cfg.obs_type != "dino"
+            or not cfg.use_cls
+            or cfg.dino_frame_stack != FlareBEncoder.num_frames
+            or cfg.goal_space is not None
+        ):
+            raise ValueError(
+                "dino_flare_b requires obs_type='dino', use_cls=True, "
+                "dino_frame_stack=3, and goal_space=None"
+            )
+        if cfg.dino_flare_b and cfg.obs_shape[0] % FlareBEncoder.num_frames:
+            raise ValueError(
+                "dino_flare_b requires an observation dimension divisible by 3"
+            )
+        if (
+            cfg.dino_flare_b
+            and cfg.dino_separate_fb_adapters
+            and not cfg.dino_use_adapter
+        ):
+            raise ValueError(
+                "dino_separate_fb_adapters requires dino_use_adapter=True"
+            )
         if cfg.fb_lr is not None and (
             not math.isfinite(cfg.fb_lr) or cfg.fb_lr <= 0
         ):
             raise ValueError("fb_lr must be finite and positive when provided")
+        for lr_name in ("lr_f", "lr_b", "lr_actor"):
+            lr_value = getattr(cfg, lr_name)
+            if lr_value is not None and (
+                not math.isfinite(lr_value) or lr_value <= 0
+            ):
+                raise ValueError(f"{lr_name} must be finite and positive when provided")
+        if cfg.dino_separate_fb_adapters and cfg.dino_separate_backward_adapter:
+            raise ValueError(
+                "dino_separate_fb_adapters and dino_separate_backward_adapter "
+                "are mutually exclusive"
+            )
+        if cfg.pixel_separate_fb_encoders:
+            if cfg.obs_type != "pixels" or cfg.goal_space is not None:
+                raise ValueError(
+                    "pixel_separate_fb_encoders requires obs_type='pixels' "
+                    "and goal_space=None"
+                )
+            if not cfg.update_encoder:
+                raise ValueError(
+                    "pixel_separate_fb_encoders requires update_encoder=True so "
+                    "both CNN encoders remain trainable"
+                )
+            if cfg.dino_separate_fb_adapters or cfg.dino_separate_backward_adapter:
+                raise ValueError(
+                    "pixel_separate_fb_encoders cannot be combined with a "
+                    "separate DINO adapter mode"
+                )
+        if cfg.dino_separate_fb_adapters and not cfg.update_encoder:
+            raise ValueError(
+                "dino_separate_fb_adapters requires update_encoder=True so both "
+                "adapters remain trainable"
+            )
         if cfg.idm_coef < 0:
             raise ValueError("idm_coef must be non-negative")
-        if cfg.idm_lr is not None and cfg.idm_lr <= 0:
-            raise ValueError("idm_lr must be positive when provided")
+        if cfg.idm_lr is not None and (
+            not math.isfinite(cfg.idm_lr) or cfg.idm_lr <= 0
+        ):
+            raise ValueError("idm_lr must be positive and finite when provided")
+        if cfg.idm_route not in IDM_ROUTES:
+            raise ValueError(
+                "idm_route must be one of 'none', 'forward_adapter', or "
+                "'backward_adapter'"
+            )
+        if cfg.idm_route != "none":
+            if cfg.idm_coef <= 0:
+                raise ValueError("an explicit idm_route requires idm_coef > 0")
+            if not cfg.dino_separate_fb_adapters:
+                raise ValueError(
+                    "explicit adapter IDM routing requires "
+                    "dino_separate_fb_adapters=True"
+                )
+            if (
+                cfg.obs_type != "dino"
+                or not cfg.dino_use_adapter
+                or cfg.goal_space is not None
+            ):
+                raise ValueError(
+                    "explicit adapter IDM routing requires obs_type='dino', "
+                    "dino_use_adapter=True, and goal_space=None"
+                )
+            if cfg.idm_encoder_mode != "static":
+                raise ValueError(
+                    "explicit adapter IDM routing requires "
+                    "idm_encoder_mode='static'"
+                )
+        elif cfg.dino_separate_fb_adapters and cfg.idm_coef > 0:
+            raise ValueError(
+                "IDM with separate F/B adapters requires an explicit idm_route"
+            )
+        if cfg.dino_flare_b and cfg.idm_route == "backward_adapter":
+            raise ValueError(
+                "backward_adapter IDM routing is unavailable when dino_flare_b=True"
+            )
         if cfg.idm_diagnostics_interval <= 0:
             raise ValueError("idm_diagnostics_interval must be positive")
         if cfg.idm_encoder_mode not in {"legacy", "static", "balanced"}:
@@ -313,10 +485,19 @@ class FBDDPGAgent:
         self.solved_meta: tp.Any = None
 
         # models
+        self.forward_encoder: tp.Optional[nn.Module] = None
+        self.forward_adapter: tp.Optional[nn.Module] = None
+        self.backward_adapter: tp.Optional[nn.Module] = None
+        self.flare_b_encoder: tp.Optional[FlareBEncoder] = None
         if cfg.obs_type == 'pixels':
             self.aug: nn.Module = utils.RandomShiftsAug(pad=4)
             self.encoder: nn.Module = Encoder(cfg.obs_shape).to(cfg.device)
             self.obs_dim = self.encoder.repr_dim
+            if cfg.pixel_separate_fb_encoders:
+                # Keep ``encoder`` as the forward/actor encoder for compatibility
+                # with the existing pixel path, and clone it before either branch
+                # has taken an optimization step.
+                self.forward_encoder = self.encoder
         elif cfg.obs_type == 'vit':
             self.aug = nn.Identity()
             self.encoder = ViTEncoder(repr_dim=512, use_cls_token=cfg.use_cls).to(cfg.device)
@@ -340,12 +521,22 @@ class FBDDPGAgent:
                         nn.Linear(cfg.dino_adapter_hidden_dim, feature_dim, bias=True),
                     ).to(cfg.device)
                     linear_layers = [self.encoder[1], self.encoder[3]]
+                elif cfg.dino_adapter_type == "mlp_ln":
+                    self.encoder = nn.Sequential(
+                        nn.LayerNorm(d),
+                        nn.Linear(d, cfg.dino_adapter_hidden_dim, bias=True),
+                        nn.GELU(),
+                        nn.Linear(cfg.dino_adapter_hidden_dim, feature_dim, bias=True),
+                        nn.LayerNorm(feature_dim),
+                    ).to(cfg.device)
+                    linear_layers = [self.encoder[1], self.encoder[3]]
                 else:
                     raise ValueError(f"Unsupported dino_adapter_type={cfg.dino_adapter_type!r}")
                 for linear in linear_layers:
                     nn.init.orthogonal_(linear.weight)
                     nn.init.zeros_(linear.bias)
                 self.obs_dim = feature_dim
+                self.forward_adapter = self.encoder
             else:
                 self.encoder = nn.Identity()
                 self.obs_dim = d
@@ -355,19 +546,33 @@ class FBDDPGAgent:
             self.obs_dim = cfg.obs_shape[0]
         self.backward_encoder: tp.Optional[nn.Module] = None
         self.backward_encoder_target: tp.Optional[nn.Module] = None
-        if cfg.dino_separate_backward_adapter:
+        if cfg.pixel_separate_fb_encoders:
+            assert self.forward_encoder is not None
+            self.backward_encoder = copy.deepcopy(self.forward_encoder).to(cfg.device)
+        elif (
+            cfg.dino_separate_backward_adapter
+            or (cfg.dino_separate_fb_adapters and not cfg.dino_flare_b)
+        ):
             if cfg.obs_type != "dino" or not cfg.dino_use_adapter or cfg.goal_space is not None:
                 raise ValueError(
-                    "dino_separate_backward_adapter requires obs_type='dino', "
+                    "separate DINO FB adapters require obs_type='dino', "
                     "dino_use_adapter=True, and goal_space=None"
                 )
             # DINO features are computed once by the environment and stored in replay.
             # Only the lightweight adapter is duplicated for the visual B path.
+            assert self.forward_adapter is not None
             self.backward_encoder = copy.deepcopy(self.encoder).to(cfg.device)
-            self.backward_encoder_target = copy.deepcopy(self.backward_encoder).to(cfg.device)
+            self.backward_adapter = self.backward_encoder
+            if cfg.dino_separate_backward_adapter:
+                # Retain the historical target-adapter topology only for the
+                # explicitly requested legacy mode.  The new separate-F/B mode
+                # deliberately has no target/EMA DINO adapter.
+                self.backward_encoder_target = copy.deepcopy(self.backward_encoder).to(cfg.device)
         if cfg.feature_dim < self.obs_dim:
             logger.warning(f"feature_dim {cfg.feature_dim} should not be smaller that obs_dim {self.obs_dim}")
-        goal_dim = self.obs_dim
+        goal_dim = (
+            FlareBEncoder.output_dim if cfg.dino_flare_b else self.obs_dim
+        )
         if cfg.goal_space is not None:
             goal_dim = _goals.get_goal_space_dim(cfg.goal_space)
         if cfg.z_dim < goal_dim:
@@ -400,8 +605,42 @@ class FBDDPGAgent:
         # optimizers
         self.encoder_opt: tp.Optional[torch.optim.Optimizer] = None
         self.backward_encoder_opt: tp.Optional[torch.optim.Optimizer] = None
+        self.forward_fb_opt: tp.Optional[torch.optim.Optimizer] = None
+        self.backward_fb_opt: tp.Optional[torch.optim.Optimizer] = None
         self.encoder_scheduler: tp.Optional[torch.optim.lr_scheduler.LambdaLR] = None
-        if cfg.obs_type == "vit":
+        separate_fb_encoders = (
+            cfg.pixel_separate_fb_encoders or cfg.dino_separate_fb_adapters
+        )
+        if separate_fb_encoders:
+            # Each visual encoder belongs to exactly one branch-local FB
+            # optimizer. Actor optimization receives detached forward features
+            # below, so it owns only Actor parameters.
+            forward_branch_encoder = (
+                self.forward_encoder
+                if cfg.pixel_separate_fb_encoders
+                else self.forward_adapter
+            )
+            backward_branch_encoder = (
+                self.backward_encoder
+                if cfg.pixel_separate_fb_encoders
+                else self.backward_adapter
+            )
+            assert forward_branch_encoder is not None
+            self.forward_fb_opt = torch.optim.Adam(
+                list(self.forward_net.parameters())
+                + list(forward_branch_encoder.parameters()),
+                lr=_effective_forward_lr(cfg),
+            )
+            backward_parameters = list(self.backward_net.parameters())
+            if backward_branch_encoder is not None:
+                backward_parameters += list(backward_branch_encoder.parameters())
+            else:
+                assert cfg.dino_flare_b
+            self.backward_fb_opt = torch.optim.Adam(
+                backward_parameters,
+                lr=_effective_backward_lr(cfg),
+            )
+        elif cfg.obs_type == "vit":
             assert isinstance(self.encoder, ViTEncoder)
             self.encoder_opt = torch.optim.AdamW(
                 [
@@ -432,14 +671,19 @@ class FBDDPGAgent:
             else:
                 self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=cfg.lr)
         if self.backward_encoder is not None:
-            self.backward_encoder_opt = torch.optim.Adam(self.backward_encoder.parameters(), lr=cfg.lr)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
+            if not separate_fb_encoders:
+                self.backward_encoder_opt = torch.optim.Adam(self.backward_encoder.parameters(), lr=cfg.lr)
+        self.actor_opt = torch.optim.Adam(
+            self.actor.parameters(), lr=_effective_actor_lr(cfg)
+        )
         # params = [p for net in [self.forward_net, self.backward_net] for p in net.parameters()]
         # self.fb_opt = torch.optim.Adam(params, lr=cfg.lr)
-        fb_lr = _effective_fb_lr(cfg)
-        self.fb_opt = torch.optim.Adam([{'params': self.forward_net.parameters()},  # type: ignore
-                                        {'params': self.backward_net.parameters(), 'lr': cfg.lr_coef * fb_lr}],
-                                       lr=fb_lr)
+        self.fb_opt: tp.Optional[torch.optim.Optimizer] = None
+        if not separate_fb_encoders:
+            fb_lr = _effective_fb_lr(cfg)
+            self.fb_opt = torch.optim.Adam([{'params': self.forward_net.parameters()},  # type: ignore
+                                            {'params': self.backward_net.parameters(), 'lr': cfg.lr_coef * fb_lr}],
+                                           lr=fb_lr)
 
         # Keep the auxiliary inverse-dynamics model outside the FB networks so
         # evaluation/inference topology is unchanged.  In particular, do not
@@ -452,6 +696,15 @@ class FBDDPGAgent:
             self.idm_head.apply(utils.weight_init)
             self.idm_optimizer = torch.optim.Adam(
                 self.idm_head.parameters(), lr=_effective_idm_lr(cfg)
+            )
+
+        self.flare_b_optimizer: tp.Optional[torch.optim.Optimizer] = None
+        if cfg.dino_flare_b:
+            frame_dim = cfg.obs_shape[0] // FlareBEncoder.num_frames
+            self.flare_b_encoder = FlareBEncoder(frame_dim).to(cfg.device)
+            self.flare_b_optimizer = torch.optim.Adam(
+                self.flare_b_encoder.parameters(),
+                lr=_effective_forward_lr(cfg),
             )
         # This is an optimizer-update counter rather than an environment-step
         # counter.  Starting at zero also guarantees that sparse diagnostic
@@ -480,6 +733,9 @@ class FBDDPGAgent:
             nets.append(self.backward_encoder)
         if self.backward_encoder_target is not None:
             nets.append(self.backward_encoder_target)
+        flare_b_encoder = getattr(self, "flare_b_encoder", None)
+        if flare_b_encoder is not None:
+            nets.append(flare_b_encoder)
         if self.idm_head is not None:
             nets.append(self.idm_head)
         for net in nets:
@@ -506,6 +762,7 @@ class FBDDPGAgent:
         else:
             source_idm_coef = 0.0
         source_encoder_mode = str(getattr(source_cfg, "idm_encoder_mode", "legacy"))
+        source_idm_route = str(getattr(source_cfg, "idm_route", "none"))
         if source_has_idm_config and (
             source_idm_coef > 0 or float(self.cfg.idm_coef) > 0
         ):
@@ -527,6 +784,12 @@ class FBDDPGAgent:
                     "IDM checkpoint/config mismatch: "
                     f"idm_encoder_mode={source_encoder_mode!r} in checkpoint but "
                     f"{self.cfg.idm_encoder_mode!r} requested"
+                )
+            if source_idm_route != self.cfg.idm_route:
+                raise ValueError(
+                    "IDM checkpoint/config mismatch: "
+                    f"idm_route={source_idm_route!r} in checkpoint but "
+                    f"{self.cfg.idm_route!r} requested"
                 )
             if self.cfg.idm_encoder_mode != "legacy":
                 schedule_fields = (
@@ -620,11 +883,15 @@ class FBDDPGAgent:
                 # formerly shared adapter when loading an older checkpoint.
                 source_backward_encoder = other.encoder
             utils.hard_update_params(source_backward_encoder, self.backward_encoder)
-            source_backward_encoder_target = getattr(other, "backward_encoder_target", None)
-            if source_backward_encoder_target is None:
-                source_backward_encoder_target = source_backward_encoder
-            assert self.backward_encoder_target is not None
-            utils.hard_update_params(source_backward_encoder_target, self.backward_encoder_target)
+            if self.backward_encoder_target is not None:
+                source_backward_encoder_target = getattr(other, "backward_encoder_target", None)
+                if source_backward_encoder_target is None:
+                    source_backward_encoder_target = source_backward_encoder
+                utils.hard_update_params(source_backward_encoder_target, self.backward_encoder_target)
+        if self.flare_b_encoder is not None:
+            source_flare_b_encoder = getattr(other, "flare_b_encoder", None)
+            if source_flare_b_encoder is not None:
+                utils.hard_update_params(source_flare_b_encoder, self.flare_b_encoder)
         if self.idm_head is not None:
             source_idm_head = getattr(other, "idm_head", None)
             if source_idm_head is not None:
@@ -840,7 +1107,9 @@ class FBDDPGAgent:
         next_goal: torch.Tensor,
         target_next_goal: torch.Tensor,
         z: torch.Tensor,
-        step: int
+        step: int,
+        idm_obs: tp.Optional[torch.Tensor] = None,
+        idm_next_obs: tp.Optional[torch.Tensor] = None,
     ) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
         # compute target successor measure
@@ -892,20 +1161,30 @@ class FBDDPGAgent:
         fb_loss += self.cfg.ortho_coef * orth_loss
 
         idm_prediction: tp.Optional[torch.Tensor] = None
+        idm_source_obs = obs
+        idm_source_next_obs = next_obs
         idm_encoder_coef = 0.0
         if self.idm_head is None:
             idm_loss = torch.zeros((), device=fb_loss.device, dtype=fb_loss.dtype)
             total_loss = fb_loss
         else:
-            idm_encoder_coef = self._idm_encoder_coefficient(step)
-            idm_obs = obs
-            idm_next_obs = next_obs
-            if self.cfg.idm_encoder_mode != "legacy":
-                idm_obs = _scale_idm_encoder_gradient(obs, idm_encoder_coef)
-                idm_next_obs = _scale_idm_encoder_gradient(next_obs, idm_encoder_coef)
-            idm_prediction = self._predict_idm_action(idm_obs, idm_next_obs)
-            idm_loss = self._compute_idm_loss(
-                idm_obs, idm_next_obs, action, prediction=idm_prediction
+            if self.cfg.idm_route != "none":
+                if idm_obs is None or idm_next_obs is None:
+                    raise RuntimeError(
+                        f"idm_route={self.cfg.idm_route!r} requires explicit "
+                        "adapter features for both transition endpoints"
+                    )
+                idm_source_obs = idm_obs
+                idm_source_next_obs = idm_next_obs
+            (
+                idm_loss,
+                idm_prediction,
+                idm_encoder_coef,
+            ) = self._compute_idm_objective(
+                idm_source_obs,
+                idm_source_next_obs,
+                action,
+                step,
             )
             if self.cfg.idm_encoder_mode == "legacy":
                 total_loss = fb_loss + self.cfg.idm_coef * idm_loss
@@ -965,12 +1244,23 @@ class FBDDPGAgent:
             metrics['z_norm'] = torch.norm(z, dim=-1).mean().item()
             metrics['fb_loss'] = fb_loss.item()
             metrics['idm_loss'] = idm_loss.item()
-            idm_scalar_coef = (
-                self.cfg.idm_coef if self.cfg.idm_encoder_mode == "legacy" else 1.0
-            )
+            if self.cfg.idm_route != "none":
+                # This is the loss proxy seen by the selected adapter. The IDM
+                # head itself is still trained with the full/raw loss.
+                idm_scalar_coef = idm_encoder_coef
+            else:
+                # Preserve historical logging for the pre-routing IDM modes.
+                idm_scalar_coef = (
+                    self.cfg.idm_coef
+                    if self.cfg.idm_encoder_mode == "legacy"
+                    else 1.0
+                )
             metrics['idm_weighted_loss'] = idm_scalar_coef * idm_loss.item()
             metrics['idm_encoder_loss_proxy'] = idm_encoder_coef * idm_loss.item()
             metrics['idm_encoder_coef_used'] = idm_encoder_coef
+            # Logger meters are numeric-only; the stable string value remains
+            # present in the Hydra/W&B config.
+            metrics['idm_route'] = IDM_ROUTE_IDS[self.cfg.idm_route]
             if self.cfg.idm_grad_ratio_target is not None:
                 metrics['idm_grad_ratio_target'] = self.cfg.idm_grad_ratio_target
                 # Keep this dense so the CSV schema established during
@@ -991,6 +1281,10 @@ class FBDDPGAgent:
             metrics['orth_l2'] = eye_diff.norm().item() / math.sqrt(B.shape[1])
             if isinstance(self.fb_opt, torch.optim.Adam):
                 metrics["fb_opt_lr"] = self.fb_opt.param_groups[0]["lr"]
+            if self.forward_fb_opt is not None:
+                metrics["lr_f"] = self.forward_fb_opt.param_groups[0]["lr"]
+            if self.backward_fb_opt is not None:
+                metrics["lr_b"] = self.backward_fb_opt.param_groups[0]["lr"]
             if self.encoder_opt is not None:
                 if self.cfg.obs_type == "vit":
                     metrics["encoder_lr_backbone"] = self.encoder_opt.param_groups[0]["lr"]
@@ -1012,9 +1306,12 @@ class FBDDPGAgent:
                     metrics["action_std"] = action_var.sqrt().item()
                     metrics["idm_pred_std"] = prediction_var.sqrt().item()
                     metrics["h_norm"] = 0.5 * (
-                        obs.norm(dim=-1).mean() + next_obs.norm(dim=-1).mean()
+                        idm_source_obs.norm(dim=-1).mean()
+                        + idm_source_next_obs.norm(dim=-1).mean()
                     ).item()
-                    metrics["delta_h_norm"] = (next_obs - obs).norm(dim=-1).mean().item()
+                    metrics["delta_h_norm"] = (
+                        idm_source_next_obs - idm_source_obs
+                    ).norm(dim=-1).mean().item()
 
         # optimize FB
         if self.encoder_opt is not None:
@@ -1023,9 +1320,28 @@ class FBDDPGAgent:
             self.backward_encoder_opt.zero_grad(set_to_none=True)
         if self.idm_optimizer is not None:
             self.idm_optimizer.zero_grad(set_to_none=True)
-        self.fb_opt.zero_grad(set_to_none=True)
+        if self.fb_opt is not None:
+            self.fb_opt.zero_grad(set_to_none=True)
+        if self.forward_fb_opt is not None:
+            self.forward_fb_opt.zero_grad(set_to_none=True)
+        if self.backward_fb_opt is not None:
+            self.backward_fb_opt.zero_grad(set_to_none=True)
+        flare_b_optimizer = getattr(self, "flare_b_optimizer", None)
+        if flare_b_optimizer is not None:
+            flare_b_optimizer.zero_grad(set_to_none=True)
 
-        encoder_parameters = tuple(self.encoder.parameters())
+        diagnostics_adapter = self.encoder
+        if self.cfg.idm_route == "backward_adapter":
+            if self.backward_adapter is None:
+                raise RuntimeError(
+                    "backward_adapter IDM route has no backward adapter"
+                )
+            diagnostics_adapter = self.backward_adapter
+        elif self.cfg.idm_route == "forward_adapter":
+            if self.forward_adapter is None:
+                raise RuntimeError("forward_adapter IDM route has no forward adapter")
+            diagnostics_adapter = self.forward_adapter
+        encoder_parameters = tuple(diagnostics_adapter.parameters())
         diagnostics_due = (
             logging_enabled
             and self.idm_head is not None
@@ -1055,10 +1371,13 @@ class FBDDPGAgent:
                 # A zero gradient-only coefficient hides the raw encoder
                 # gradient. Re-run only the tiny linear IDM head at sparse
                 # diagnostic points so burn-in metrics remain truthful.
-                raw_idm_prediction = self._predict_idm_action(obs, next_obs)
+                raw_idm_prediction = self._predict_idm_action(
+                    idm_source_obs,
+                    idm_source_next_obs,
+                )
                 idm_probe_loss = self._compute_idm_loss(
-                    obs,
-                    next_obs,
+                    idm_source_obs,
+                    idm_source_next_obs,
                     action,
                     prediction=raw_idm_prediction,
                 )
@@ -1119,6 +1438,24 @@ class FBDDPGAgent:
             metrics['F1_grad_norm'] = _grad_norm(self.forward_net.F1.parameters())
             metrics['F2_grad_norm'] = _grad_norm(self.forward_net.F2.parameters())
             metrics['F_grad_norm'] = _grad_norm(self.forward_net.parameters())
+            metrics['B_grad_norm'] = _grad_norm(self.backward_net.parameters())
+            if self.forward_adapter is not None:
+                metrics['forward_adapter_grad_norm'] = _grad_norm(
+                    self.forward_adapter.parameters()
+                )
+            if self.backward_adapter is not None:
+                metrics['backward_adapter_grad_norm'] = _grad_norm(
+                    self.backward_adapter.parameters()
+                )
+            if self.cfg.pixel_separate_fb_encoders:
+                assert self.forward_encoder is not None
+                assert self.backward_encoder is not None
+                metrics['forward_encoder_grad_norm'] = _grad_norm(
+                    self.forward_encoder.parameters()
+                )
+                metrics['backward_encoder_grad_norm'] = _grad_norm(
+                    self.backward_encoder.parameters()
+                )
         if logging_enabled and self.encoder_opt is not None:
             # Current-batch gradient, deliberately measured after backward and
             # before clipping/optimizer.step().
@@ -1134,17 +1471,30 @@ class FBDDPGAgent:
             metrics["encoder_grad_cosine_fb_idm"] = weighted_dot / (
                 fb_grad_norm * cosine_idm_grad_norm + eps
             )
+            if self.cfg.idm_route != "none":
+                metrics["idm_adapter_grad_norm"] = weighted_idm_grad_norm
+                metrics["fb_adapter_grad_norm"] = fb_grad_norm
+                metrics["idm_fb_adapter_grad_cosine"] = metrics[
+                    "encoder_grad_cosine_fb_idm"
+                ]
             assert self.idm_head is not None
             metrics["idm_head_grad_norm"] = _grad_norm(self.idm_head.parameters())
             if next_balanced_state is not None:
                 metrics["idm_encoder_coef_next"] = next_balanced_state[0]
         if self.cfg.obs_type == "vit" and self.encoder_opt is not None and self.cfg.update_encoder and self.cfg.vit_encoder_grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.cfg.vit_encoder_grad_clip)
-        self.fb_opt.step()
+        if self.fb_opt is not None:
+            self.fb_opt.step()
+        if self.forward_fb_opt is not None:
+            self.forward_fb_opt.step()
+        if self.backward_fb_opt is not None:
+            self.backward_fb_opt.step()
         if self.encoder_opt is not None:
             self.encoder_opt.step()
         if self.backward_encoder_opt is not None:
             self.backward_encoder_opt.step()
+        if flare_b_optimizer is not None:
+            flare_b_optimizer.step()
         if self.idm_optimizer is not None:
             self.idm_optimizer.step()
         if self.encoder_scheduler is not None and self.cfg.update_encoder:
@@ -1159,6 +1509,31 @@ class FBDDPGAgent:
             self._idm_diagnostics_pending = False
         self._idm_update_count += 1
         return metrics
+
+    def _compute_idm_objective(
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+        action: torch.Tensor,
+        step: int,
+    ) -> tp.Tuple[torch.Tensor, torch.Tensor, float]:
+        """Build IDM loss while scaling gradients only at its adapter input."""
+        if self.idm_head is None:
+            raise RuntimeError("Cannot compute IDM objective when idm_coef is zero")
+        encoder_coef = self._idm_encoder_coefficient(step)
+        idm_obs = obs
+        idm_next_obs = next_obs
+        if self.cfg.idm_encoder_mode != "legacy":
+            idm_obs = _scale_idm_encoder_gradient(obs, encoder_coef)
+            idm_next_obs = _scale_idm_encoder_gradient(next_obs, encoder_coef)
+        prediction = self._predict_idm_action(idm_obs, idm_next_obs)
+        loss = self._compute_idm_loss(
+            idm_obs,
+            idm_next_obs,
+            action,
+            prediction=prediction,
+        )
+        return loss, prediction, encoder_coef
 
     def _predict_idm_action(
         self,
@@ -1224,8 +1599,14 @@ class FBDDPGAgent:
         return self.encoder(obs)
 
     def backward_aug_and_encode(self, obs: torch.Tensor) -> torch.Tensor:
+        flare_b_encoder = getattr(self, "flare_b_encoder", None)
+        if flare_b_encoder is not None:
+            return flare_b_encoder(obs)
         if self.backward_encoder is None:
             return self.aug_and_encode(obs)
+        if self.cfg.obs_type == "pixels":
+            obs = self.aug(obs.float())
+            return self.backward_encoder(obs)
         # A separate backward adapter is only valid for cached 1-D DINO
         # embeddings, batched here as (batch, feature_dim).
         return self.backward_encoder(obs)
@@ -1237,6 +1618,7 @@ class FBDDPGAgent:
 
     def update(self, replay_loader: ReplayBuffer, step: int) -> tp.Dict[str, float]:
         metrics: tp.Dict[str, float] = {}
+        flare_b_encoder = getattr(self, "flare_b_encoder", None)
 
         if step % self.cfg.update_every_steps != 0:
             return metrics
@@ -1249,19 +1631,45 @@ class FBDDPGAgent:
         action = batch.action
         discount = batch.discount
         next_obs = next_goal = target_next_goal = batch.next_obs
+        idm_obs: tp.Optional[torch.Tensor] = None
+        idm_next_obs: tp.Optional[torch.Tensor] = None
+        backward_next_obs_for_idm: tp.Optional[torch.Tensor] = None
         if self.cfg.goal_space is not None:
             assert batch.next_goal is not None
             next_goal = target_next_goal = batch.next_goal
 
         if self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
-            obs = self.aug_and_encode(batch.obs)
-            next_obs = self.aug_and_encode(batch.next_obs)
+            if self.cfg.pixel_separate_fb_encoders:
+                # Augment each raw pixel tensor once per update. When the same
+                # observation feeds both branches, the independent CNNs consume
+                # the exact same random-shift realization.
+                assert self.forward_encoder is not None
+                augmented_obs = self.aug(batch.obs.float())
+                augmented_next_obs = self.aug(batch.next_obs.float())
+                obs = self.forward_encoder(augmented_obs)
+                next_obs = self.forward_encoder(augmented_next_obs)
+            else:
+                obs = self.aug_and_encode(batch.obs)
+                next_obs = self.aug_and_encode(batch.next_obs)
+            if self.cfg.idm_route == "forward_adapter":
+                idm_obs = obs
+                idm_next_obs = next_obs
 
             if self.cfg.goal_space is None:
-                if self.backward_encoder is not None:
-                    next_goal = self.backward_aug_and_encode(batch.next_obs)
-                    with torch.no_grad():
-                        target_next_goal = self.backward_target_aug_and_encode(batch.next_obs)
+                if self.backward_encoder is not None or flare_b_encoder is not None:
+                    if self.cfg.pixel_separate_fb_encoders:
+                        next_goal = self.backward_encoder(augmented_next_obs)
+                    else:
+                        next_goal = self.backward_aug_and_encode(batch.next_obs)
+                    backward_next_obs_for_idm = next_goal
+                    if self.backward_encoder_target is None:
+                        # The new separate-F/B topology has no target adapter;
+                        # its target BackwardMap consumes a detached view of the
+                        # same online B-side features.
+                        target_next_goal = next_goal.detach()
+                    else:
+                        with torch.no_grad():
+                            target_next_goal = self.backward_target_aug_and_encode(batch.next_obs)
                 else:
                     next_goal = next_obs
                     target_next_goal = next_goal
@@ -1275,7 +1683,8 @@ class FBDDPGAgent:
             if not self.cfg.update_encoder:
                 obs = obs.detach()
                 next_obs = next_obs.detach()
-                next_goal = next_goal.detach()
+                if flare_b_encoder is None:
+                    next_goal = next_goal.detach()
                 target_next_goal = target_next_goal.detach()
 
         # if len(batch.meta) == 1 and batch.meta[0].shape[-1] == self.cfg.z_dim:
@@ -1300,14 +1709,30 @@ class FBDDPGAgent:
             future_goal = batch.future_goal
         if self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
             if self.cfg.goal_space is None:
-                backward_input = self.backward_aug_and_encode(backward_input)
-                future_goal = self.backward_aug_and_encode(future_goal)
+                if self.cfg.pixel_separate_fb_encoders:
+                    assert self.backward_encoder is not None
+                    assert future_goal is not None
+                    backward_input = self.backward_encoder(augmented_obs)
+                    future_aug = self.aug(future_goal.float())
+                    future_goal = self.backward_encoder(future_aug)
+                else:
+                    backward_input = self.backward_aug_and_encode(backward_input)
+                    future_goal = self.backward_aug_and_encode(future_goal)
             elif backward_input[-1].ndim != 1:
                 backward_input = self.aug_and_encode(backward_input)
                 future_goal = self.aug_and_encode(future_goal)
-            if not self.cfg.update_encoder:
+            if not self.cfg.update_encoder and flare_b_encoder is None:
                 backward_input = backward_input.detach()
                 future_goal = future_goal.detach()
+
+        if self.cfg.idm_route == "backward_adapter":
+            if backward_next_obs_for_idm is None:
+                raise RuntimeError(
+                    "backward_adapter IDM routing requires visual next-observation "
+                    "features from the backward adapter"
+                )
+            idm_obs = backward_input
+            idm_next_obs = backward_next_obs_for_idm
 
         # if self.cfg.goal_space is None:
         #     backward_input = obs
@@ -1346,10 +1771,11 @@ class FBDDPGAgent:
 
         metrics.update(self.update_fb(obs=obs, action=action, discount=discount,
                                       next_obs=next_obs, next_goal=next_goal,
-                                      target_next_goal=target_next_goal, z=z, step=step))
+                                      target_next_goal=target_next_goal, z=z, step=step,
+                                      idm_obs=idm_obs, idm_next_obs=idm_next_obs))
 
         # update actor
-        if self.encoder_opt is not None:
+        if self.encoder_opt is not None or self.forward_fb_opt is not None:
             metrics.update(self.update_actor(obs.detach(), z, step))
         else:
             metrics.update(self.update_actor(obs, z, step))
@@ -1359,8 +1785,8 @@ class FBDDPGAgent:
                                  self.cfg.fb_target_tau)
         utils.soft_update_params(self.backward_net, self.backward_target_net,
                                  self.cfg.fb_target_tau)
-        if self.backward_encoder is not None:
-            assert self.backward_encoder_target is not None
+        if self.backward_encoder_target is not None:
+            assert self.backward_encoder is not None
             utils.soft_update_params(self.backward_encoder, self.backward_encoder_target,
                                      self.cfg.fb_target_tau)
 
