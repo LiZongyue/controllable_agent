@@ -8,11 +8,18 @@ import json
 import pdb  # pylint: disable=unused-import
 import logging
 import dataclasses
+import sys
 import typing as tp
 import warnings
 from pathlib import Path
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+# Allow `python url_benchmark/pretrain.py` in addition to module execution.
+if __package__ in (None, ""):
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 
 
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
@@ -39,6 +46,8 @@ from url_benchmark import agent as agents
 from url_benchmark.d4rl_benchmark import D4RLReplayBufferBuilder, D4RLWrapper
 from url_benchmark.gridworld.env import build_gridworld_task
 
+from transformers import AutoImageProcessor, AutoModel
+
 logger = logging.getLogger(__name__)
 torch.backends.cudnn.benchmark = True
 # os.environ['WANDB_MODE']='offline'
@@ -62,12 +71,18 @@ class Config:
     experiment: str = "online"
     # task settings
     task: str = "walker_stand"
-    obs_type: str = "states"  # [states, pixels]
-    frame_stack: int = 3  # only works if obs_type=pixels
-    action_repeat: int = 1  # set to 2 for pixels
+    obs_type: str = "dino"  # [states, pixels, dino, vit]
+    frame_stack: int = 3  # pixel stack; retained for compatibility with historical configs
+    dino_frame_stack: int = 1  # explicit DINO embedding stack; historical DINO runs used one frame
+    action_repeat: int = 2  # set to 2 for pixels
+    use_cls: bool = True  # whether to use the dino cls token instead of the mean pooled features, only works if obs_type=dino
+    # Kept configurable so profiling/reproduction can pin the visual backbone used
+    # by an experiment.  The default preserves the current training behavior.
+    dino_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     discount: float = 0.99
+    render_shape: tp.Tuple[int, int] = (224, 224)  # only used for visual obs (pixels, dino, vit)
     future: float = 0.99  # discount of future sampling, future=1 means no future sampling
-    goal_space: tp.Optional[str] = None
+    goal_space: tp.Optional[str] = "simplified_walker"
     append_goal_to_observation: bool = False
     # eval
     num_eval_episodes: int = 10
@@ -78,6 +93,9 @@ class Config:
                                        2000000, 3000000, 4000000, 5000000, 9000000, 10000000)
     checkpoint_every: int = 100000
     load_model: tp.Optional[str] = None
+    auto_resume: bool = True
+    checkpoint_root: tp.Optional[str] = "/mnt/data_7tb/fanfeng/controallable_agent_ckpt"
+    save_replay_buffer_in_checkpoint: bool = False
     # training
     num_seed_frames: int = 4000
     replay_buffer_episodes: int = 5000
@@ -109,11 +127,76 @@ ConfigStore.instance().store(name="workspace_config", node=PretrainConfig)
 # # # Implem # # #
 
 
+def _validate_idm_training_config(cfg: tp.Any) -> None:
+    """Keep the IDM auxiliary on the three-frame DINO CLS FB variant."""
+    idm_coef = float(getattr(cfg.agent, "idm_coef", 0.0))
+    idm_lr = getattr(cfg.agent, "idm_lr", None)
+    idm_encoder_mode = str(getattr(cfg.agent, "idm_encoder_mode", "legacy"))
+    if idm_coef < 0:
+        raise ValueError("agent.idm_coef must be non-negative")
+    if idm_lr is not None and float(idm_lr) <= 0:
+        raise ValueError("agent.idm_lr must be positive when provided")
+    if idm_coef > 0 and not bool(getattr(cfg, "update_encoder", False)):
+        raise ValueError("agent.idm_coef > 0 requires update_encoder=True")
+    idm_configured = (
+        idm_coef != 0
+        or idm_lr is not None
+        or idm_encoder_mode != "legacy"
+        or int(getattr(cfg.agent, "idm_encoder_burnin_steps", 0)) != 0
+        or int(getattr(cfg.agent, "idm_encoder_ramp_steps", 0)) != 0
+        or getattr(cfg.agent, "idm_grad_ratio_target", None) is not None
+    )
+    if idm_configured and (
+        getattr(cfg.agent, "name", None) != "fb_ddpg"
+        or cfg.obs_type != "dino"
+        or not cfg.use_cls
+        or cfg.dino_frame_stack != 3
+    ):
+        raise ValueError(
+            "IDM auxiliary training is supported only for FB with three-frame DINO CLS observations"
+        )
+
+
+def _init_wandb(cfg: tp.Any, exp_name: str) -> None:
+    """Initialize a resumable run with frame-based metric namespaces."""
+    wandb_project = os.environ.get("WANDB_PROJECT", "controllable_agent_baseline")
+    wandb_kwargs: tp.Dict[str, tp.Any] = {}
+    wandb_run_id = os.environ.get("WANDB_RUN_ID")
+    wandb_resume = os.environ.get("WANDB_RESUME")
+    if wandb_resume and not wandb_run_id:
+        raise ValueError("WANDB_RESUME requires a stable WANDB_RUN_ID")
+    if wandb_run_id:
+        wandb_kwargs["id"] = wandb_run_id
+        wandb_kwargs["resume"] = wandb_resume or "allow"
+
+    wandb.init(
+        project=wandb_project,
+        group=cfg.agent.name,
+        name=os.environ.get("WANDB_RUN_NAME", exp_name),
+        config=omgcf.OmegaConf.to_container(
+            cfg, resolve=True, throw_on_missing=True
+        ),
+        **wandb_kwargs,
+    )  # type: ignore
+    # W&B's internal step is process-local and can jump after checkpoint
+    # recovery. Every experiment metric instead uses environment frames.
+    for namespace in ("train", "eval", "final"):
+        frame_metric = f"{namespace}/frame"
+        wandb.define_metric(frame_metric)
+        wandb.define_metric(f"{namespace}/*", step_metric=frame_metric)
+
+
 def make_agent(
     obs_type: str, obs_spec, action_spec, num_expl_steps: int, cfg: omgcf.DictConfig
 ) -> tp.Union[agents.FBDDPGAgent, agents.DDPGAgent]:
     cfg.obs_type = obs_type
-    cfg.obs_shape = obs_spec.shape
+    if obs_type == "pixels" or obs_type == "vit" or obs_type == "dino":
+        cfg.obs_shape = obs_spec.shape
+    elif obs_type == "states":
+        cfg.obs_shape = obs_spec["observations"].shape if isinstance(obs_spec, dict) else obs_spec.shape
+    else:
+        raise ValueError(f"Unsupported obs_type={obs_type} for obs_spec={type(obs_spec)}")
+
     cfg.action_shape = (action_spec.num_values, ) if isinstance(action_spec, specs.DiscreteArray) \
         else action_spec.shape
     cfg.num_expl_steps = num_expl_steps
@@ -207,6 +290,12 @@ def _init_eval_meta(workspace: "BaseWorkspace", custom_reward: tp.Optional[_goal
 
 
 class BaseWorkspace(tp.Generic[C]):
+    @staticmethod
+    def _checkpoint_path_for(work_dir: Path, checkpoint_root: tp.Optional[str]) -> Path:
+        if checkpoint_root is None:
+            return work_dir / "models" / "latest.pt"
+        return Path(checkpoint_root).expanduser() / work_dir.name / "latest.pt"
+
     def __init__(self, cfg: C) -> None:
         self.work_dir = Path.cwd()
         print(f'Workspace: {self.work_dir}')
@@ -215,6 +304,7 @@ class BaseWorkspace(tp.Generic[C]):
         logger.info(f'Running code in : {Path(__file__).parent.resolve().absolute()}')
 
         self.cfg = cfg
+        _validate_idm_training_config(cfg)
         utils.set_seed_everywhere(cfg.seed)
         if not torch.cuda.is_available():
             if cfg.device != "cpu":
@@ -232,6 +322,8 @@ class BaseWorkspace(tp.Generic[C]):
         task = cfg.task
         if task.startswith('point_mass_maze'):
             self.domain = 'point_mass_maze'
+        elif task.startswith('point_mass_'):
+            self.domain = 'point_mass'
         else:
             self.domain = task.split('_', maxsplit=1)[0]
 
@@ -251,11 +343,13 @@ class BaseWorkspace(tp.Generic[C]):
                              use_hiplog=cfg.use_hiplog)
 
         if cfg.use_wandb:
-            exp_name = '_'.join([
-                cfg.experiment, cfg.agent.name, self.domain
-            ])
-            wandb.init(project="controllable_agent", group=cfg.agent.name, name=exp_name,  # mode="disabled",
-                       config=omgcf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))  # type: ignore
+            exp_name_parts = [cfg.experiment, cfg.obs_type, cfg.agent.name]
+            if cfg.obs_type == "dino":
+                exp_name_parts.append("cls" if cfg.use_cls else "patch")
+                exp_name_parts.append(cfg.agent.dino_adapter_type if cfg.agent.dino_use_adapter else "no_adaptor")
+            exp_name_parts.append(cfg.task)
+            exp_name = '_'.join(exp_name_parts)
+            _init_wandb(cfg, exp_name)
 
         if cfg.use_hiplog:
             # record config now that it is filled
@@ -303,11 +397,27 @@ class BaseWorkspace(tp.Generic[C]):
         self.global_step = 0
         self.global_episode = 0
         self.eval_rewards_history: tp.List[float] = []
-        self._checkpoint_filepath = self.work_dir / "models" / "latest.pt"
-        if self._checkpoint_filepath.exists():
-            self.load_checkpoint(self._checkpoint_filepath)
+        self._needs_replay_warmup = False
+        self._replay_warmup_warned = False
+        self._legacy_checkpoint_filepath = self.work_dir / "models" / "latest.pt"
+        self._checkpoint_filepath = self._checkpoint_path_for(self.work_dir, cfg.checkpoint_root)
+        self._resume_checkpoint_filepath: tp.Optional[Path] = None
+        if cfg.auto_resume:
+            for candidate in (self._checkpoint_filepath, self._legacy_checkpoint_filepath):
+                if candidate.exists():
+                    self._resume_checkpoint_filepath = candidate
+                    break
+        if self._resume_checkpoint_filepath is not None:
+            self.load_checkpoint(
+                self._resume_checkpoint_filepath,
+                strict_optimizer_lr=True,
+            )
         elif cfg.load_model is not None:
-            self.load_checkpoint(cfg.load_model, exclude=["replay_loader"])
+            self.load_checkpoint(
+                cfg.load_model,
+                exclude=["replay_loader"],
+                strict_optimizer_lr=False,
+            )
 
         self.reward_cls: tp.Optional[_goals.BaseReward] = None
         if self.cfg.custom_reward == "maze_multi_goal":
@@ -315,14 +425,26 @@ class BaseWorkspace(tp.Generic[C]):
 
     def _make_env(self) -> dmc.EnvWrapper:
         cfg = self.cfg
+        dino_model = None
+        processor = None
         if self.domain == "grid":
             return dmc.EnvWrapper(build_gridworld_task(self.cfg.task.split('_')[1]))
         if self.domain == "d4rl":
             import d4rl  # type: ignore # pylint: disable=unused-import
             import gym
             return dmc.EnvWrapper(D4RLWrapper(gym.make(self.cfg.task.split('_')[1])))
+        if cfg.obs_type == 'dino':
+            processor = AutoImageProcessor.from_pretrained(cfg.dino_model_name, use_fast=True)
+            model = AutoModel.from_pretrained(cfg.dino_model_name)
+
+            model.to(cfg.device)
+            model.eval()
+
+            dino_model = model
         return dmc.make(cfg.task, cfg.obs_type, cfg.frame_stack, cfg.action_repeat, cfg.seed,
-                        goal_space=cfg.goal_space, append_goal_to_observation=cfg.append_goal_to_observation)
+                        goal_space=cfg.goal_space, append_goal_to_observation=cfg.append_goal_to_observation,
+                        dino_model=dino_model, dino_processor=processor, use_cls=cfg.use_cls,
+                        render_shape=cfg.render_shape, dino_frame_stack=cfg.dino_frame_stack)
 
     @property
     def global_frame(self) -> int:
@@ -346,8 +468,8 @@ class BaseWorkspace(tp.Generic[C]):
             goal_distances = list()
             meta = self.agent.get_goal_meta(g)
             for episode in range(self.cfg.num_eval_episodes):
-                self.video_recorder.init(self.eval_env, enabled=(episode == 0))
                 time_step = self.eval_env.reset()
+                self.video_recorder.init(self.eval_env, enabled=(episode == 0))
                 episode_reward = 0.0
                 while not time_step.last():
                     with torch.no_grad(), utils.eval_mode(self.agent):
@@ -371,7 +493,7 @@ class BaseWorkspace(tp.Generic[C]):
             log('step', self.global_step)
             log('episode', self.global_episode)
 
-    def eval(self) -> None:
+    def eval(self, log_metrics: bool = True) -> float:
         step, episode = 0, 0
         eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
         physics_agg = dmc.PhysicsAggregator()
@@ -416,39 +538,60 @@ class BaseWorkspace(tp.Generic[C]):
             episode += 1
             self.video_recorder.save(f'{self.global_frame}.mp4')
 
-        self.eval_rewards_history.append(float(np.mean(rewards)))
-        with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
-            if is_d4rl_task:
-                log('episode_normalized_score', float(100 * np.mean(normalized_scores)))
-            log('episode_reward', self.eval_rewards_history[-1])
-            if len(rewards) > 1:
-                log('episode_reward#std', float(np.std(rewards)))
-            log('episode_length', step * self.cfg.action_repeat / episode)
-            log('episode', self.global_episode)
-            log('z_correl', z_correl / episode)
-            log('step', self.global_step)
-            if actor_success:
-                log('actor_sucess', float(np.mean(actor_success)))
-            if isinstance(self.agent, agents.FBDDPGAgent):
-                log('z_norm', np.linalg.norm(meta['z']).item())
-            for key, val in physics_agg.dump():
-                log(key, val)
+        mean_reward = float(np.mean(rewards))
+        self.eval_rewards_history.append(mean_reward)
+        if log_metrics:
+            with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
+                if is_d4rl_task:
+                    log('episode_normalized_score', float(100 * np.mean(normalized_scores)))
+                log('episode_reward', mean_reward)
+                if len(rewards) > 1:
+                    log('episode_reward#std', float(np.std(rewards)))
+                log('episode_length', step * self.cfg.action_repeat / episode)
+                log('episode', self.global_episode)
+                log('z_correl', z_correl / episode)
+                log('step', self.global_step)
+                if actor_success:
+                    log('actor_sucess', float(np.mean(actor_success)))
+                if isinstance(self.agent, agents.FBDDPGAgent):
+                    log('z_norm', np.linalg.norm(meta['z']).item())
+                for key, val in physics_agg.dump():
+                    log(key, val)
+        return mean_reward
 
     _CHECKPOINTED_KEYS = ('agent', 'global_step', 'global_episode', "replay_loader")
 
     def save_checkpoint(self, fp: tp.Union[Path, str], exclude: tp.Sequence[str] = ()) -> None:
         logger.info(f"Saving checkpoint to {fp}")
         exclude = list(exclude)
+        if not self.cfg.save_replay_buffer_in_checkpoint and "replay_loader" not in exclude:
+            exclude.append("replay_loader")
         assert all(x in self._CHECKPOINTED_KEYS for x in exclude)
         fp = Path(fp)
         fp.parent.mkdir(exist_ok=True, parents=True)
-        assert isinstance(self.replay_loader, ReplayBuffer), "Is this buffer designed for checkpointing?"
+        if "replay_loader" not in exclude:
+            assert isinstance(self.replay_loader, ReplayBuffer), "Is this buffer designed for checkpointing?"
         # this is just a dumb security check to not forget about it
         payload = {k: self.__dict__[k] for k in self._CHECKPOINTED_KEYS if k not in exclude}
-        with fp.open('wb') as f:
-            torch.save(payload, f, pickle_protocol=4)
+        tmp_fp = fp.with_name(f".{fp.name}.tmp.{os.getpid()}")
+        try:
+            with tmp_fp.open('wb') as f:
+                torch.save(payload, f, pickle_protocol=4)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_fp.replace(fp)
+        finally:
+            if tmp_fp.exists():
+                tmp_fp.unlink()
 
-    def load_checkpoint(self, fp: tp.Union[Path, str], only: tp.Optional[tp.Sequence[str]] = None, exclude: tp.Sequence[str] = ()) -> None:
+    def load_checkpoint(
+        self,
+        fp: tp.Union[Path, str],
+        only: tp.Optional[tp.Sequence[str]] = None,
+        exclude: tp.Sequence[str] = (),
+        *,
+        strict_optimizer_lr: bool = False,
+    ) -> None:
         """Reloads a checkpoint or part of it
 
         Parameters
@@ -457,11 +600,15 @@ class BaseWorkspace(tp.Generic[C]):
             reloads only a specific subset (defaults to all)
         exclude: sequence of str
             does not reload the provided keys
+        strict_optimizer_lr: bool
+            validates FB/DDPG optimizer learning rates for a true resume
         """
         print(f"loading checkpoint from {fp}")
         fp = Path(fp)
+        if fp.stat().st_size == 0:
+            raise RuntimeError(f"Checkpoint {fp} is empty, likely due to an interrupted write")
         with fp.open('rb') as f:
-            payload = torch.load(f)
+            payload = torch.load(f, weights_only=False)
         _update_legacy_class(payload, (ReplayBuffer,))
         if isinstance(payload, ReplayBuffer):  # compatibility with pure buffers pickles
             payload = {"replay_loader": payload}
@@ -471,12 +618,20 @@ class BaseWorkspace(tp.Generic[C]):
             payload = {x: payload[x] for x in only}
         exclude = list(exclude)
         assert all(x in self._CHECKPOINTED_KEYS for x in exclude)
+        self._needs_replay_warmup = "replay_loader" not in payload
+        self._replay_warmup_warned = False
         for x in exclude:
             payload.pop(x, None)
         for name, val in payload.items():
             logger.info("Reloading %s from %s", name, fp)
             if name == "agent":
-                self.agent.init_from(val)
+                if isinstance(self.agent, agents.FBDDPGAgent):
+                    self.agent.init_from(
+                        val,
+                        strict_optimizer_lr=strict_optimizer_lr,
+                    )
+                else:
+                    self.agent.init_from(val)
             elif name == "replay_loader":
                 _update_legacy_class(val, (ReplayBuffer,))
                 assert isinstance(val, ReplayBuffer)
@@ -499,38 +654,63 @@ class BaseWorkspace(tp.Generic[C]):
         if not repeat:
             return
 
-        if self.cfg.custom_reward == "maze_multi_goal":
-            eval_hist = self.eval_rewards_history
-            rewards = {}
-            self.eval_rewards_history = []
-            self.cfg.num_eval_episodes = repeat
-            self.eval_maze_goals()
-            rewards["rewards"] = self.eval_rewards_history
-            self.eval_rewards_history = eval_hist  # restore
-        else:
-            domain_tasks = {
-                "cheetah": ['walk', 'walk_backward', 'run', 'run_backward'],
-                "quadruped": ['stand', 'walk', 'run', 'jump'],
-                "walker": ['stand', 'walk', 'run', 'flip'],
-            }
-            if self.domain not in domain_tasks:
-                return
-            eval_hist = self.eval_rewards_history
-            rewards = {}
-            for name in domain_tasks[self.domain]:
-                task = "_".join([self.domain, name])
-                self.cfg.task = task
-                self.cfg.custom_reward = task  # for the replay buffer
-                self.cfg.seed += 1  # for the sake of avoiding similar seeds
-                self.eval_env = self._make_env()
+        training_task = self.cfg.task
+        original_custom_reward = self.cfg.custom_reward
+        original_seed = self.cfg.seed
+        original_num_eval_episodes = self.cfg.num_eval_episodes
+        original_eval_env = self.eval_env
+        eval_hist = self.eval_rewards_history
+        rewards: tp.Dict[str, tp.List[float]] = {}
+        try:
+            if self.cfg.custom_reward == "maze_multi_goal":
                 self.eval_rewards_history = []
-                self.cfg.num_eval_episodes = 1
-                for _ in range(repeat):
-                    self.eval()
-                rewards[task] = self.eval_rewards_history
-        self.eval_rewards_history = eval_hist  # restore
+                self.cfg.num_eval_episodes = repeat
+                self.eval_maze_goals()
+                rewards["rewards"] = list(self.eval_rewards_history)
+            else:
+                domain_tasks = {
+                    "cheetah": ['walk', 'walk_backward', 'run', 'run_backward'],
+                    "quadruped": ['stand', 'walk', 'run', 'jump'],
+                    "walker": ['stand', 'walk', 'run', 'flip'],
+                }
+                if self.domain not in domain_tasks:
+                    return
+                for name in domain_tasks[self.domain]:
+                    task = "_".join([self.domain, name])
+                    self.cfg.task = task
+                    self.cfg.custom_reward = task  # for the replay buffer
+                    self.cfg.seed += 1  # for the sake of avoiding similar seeds
+                    self.eval_env = self._make_env()
+                    self.eval_rewards_history = []
+                    self.cfg.num_eval_episodes = 1
+                    for _ in range(repeat):
+                        # Final cross-task evaluation has its own task-specific
+                        # W&B keys and must not contaminate periodic
+                        # eval/episode_reward for the training task.
+                        self.eval(log_metrics=False)
+                    rewards[task] = list(self.eval_rewards_history)
+        finally:
+            self.cfg.task = training_task
+            self.cfg.custom_reward = original_custom_reward
+            self.cfg.seed = original_seed
+            self.cfg.num_eval_episodes = original_num_eval_episodes
+            self.eval_env = original_eval_env
+            self.eval_rewards_history = eval_hist
+
         with (self.work_dir / "test_rewards.json").open("w") as f:
             json.dump(rewards, f)
+        if self.cfg.use_wandb and self.domain in {"walker", "quadruped", "cheetah"}:
+            final_metrics = {
+                f"final/{task}": float(np.mean(task_rewards))
+                for task, task_rewards in rewards.items()
+            }
+            final_metrics["final/frame"] = self.global_frame
+            wandb.log(final_metrics)
+            if wandb.run is not None:
+                wandb.run.summary["training_task"] = training_task
+                wandb.run.summary["final_eval_domain"] = self.domain
+                for key, value in final_metrics.items():
+                    wandb.run.summary[key] = value
 
 
 class Workspace(BaseWorkspace[PretrainConfig]):
@@ -538,7 +718,7 @@ class Workspace(BaseWorkspace[PretrainConfig]):
         super().__init__(cfg)
         self.train_video_recorder = TrainVideoRecorder(self.work_dir if cfg.save_train_video else None,
                                                        camera_id=self.video_recorder.camera_id, use_wandb=self.cfg.use_wandb)
-        if not self._checkpoint_filepath.exists():  # don't relay if there is a checkpoint
+        if self._resume_checkpoint_filepath is None:  # don't relay if there is a checkpoint
             if cfg.load_replay_buffer is not None:
                 if self.cfg.task.split('_')[0] == "d4rl":
                     d4rl_replay_buffer_builder = D4RLReplayBufferBuilder()
@@ -571,7 +751,7 @@ class Workspace(BaseWorkspace[PretrainConfig]):
         time_step = self.train_env.reset()
         meta = self._init_meta()
         self.replay_loader.add(time_step, meta)
-        self.train_video_recorder.init(time_step.observation)
+        self.train_video_recorder.init(self.train_env)
         metrics = None
         physics_agg = dmc.PhysicsAggregator()
 
@@ -605,7 +785,7 @@ class Workspace(BaseWorkspace[PretrainConfig]):
                 time_step = self.train_env.reset()
                 meta = self._init_meta()
                 self.replay_loader.add(time_step, meta)
-                self.train_video_recorder.init(time_step.observation)
+                self.train_video_recorder.init(self.train_env)
                 # try to save snapshot
                 if self.global_frame in self.cfg.snapshot_at:
                     self.save_checkpoint(self._checkpoint_filepath.with_name(f'snapshot_{self.global_frame}.pt'))
@@ -633,21 +813,29 @@ class Workspace(BaseWorkspace[PretrainConfig]):
 
             # try to update the agent
             if not seed_until_step(self.global_step):
-                # TODO: reward_free should be handled in the agent update itself !
-                # TODO: the commented code below raises incompatible type "Generator[EpisodeBatch[ndarray[Any, Any]], None, None]"; expected "ReplayBuffer"
-                # replay = (x.with_no_reward() if self.cfg.reward_free else x for x in self.replay_loader)
-                if isinstance(self.agent, agents.GoalTD3Agent) and isinstance(self.reward_cls, _goals.MazeMultiGoal):
-                    metrics = self.agent.update(self.replay_loader, self.global_step, self.reward_cls)
+                if self._needs_replay_warmup and len(self.replay_loader) == 0:
+                    if not self._replay_warmup_warned:
+                        logger.warning("Checkpoint was loaded without replay buffer; skipping updates until one episode is collected")
+                        self._replay_warmup_warned = True
                 else:
-                    metrics = self.agent.update(self.replay_loader, self.global_step)
-                self.logger.log_metrics(metrics, self.global_frame, ty='train')
+                    if self._needs_replay_warmup:
+                        logger.info("Replay warmup complete; resuming agent updates")
+                        self._needs_replay_warmup = False
+                    # TODO: reward_free should be handled in the agent update itself !
+                    # TODO: the commented code below raises incompatible type "Generator[EpisodeBatch[ndarray[Any, Any]], None, None]"; expected "ReplayBuffer"
+                    # replay = (x.with_no_reward() if self.cfg.reward_free else x for x in self.replay_loader)
+                    if isinstance(self.agent, agents.GoalTD3Agent) and isinstance(self.reward_cls, _goals.MazeMultiGoal):
+                        metrics = self.agent.update(self.replay_loader, self.global_step, self.reward_cls)
+                    else:
+                        metrics = self.agent.update(self.replay_loader, self.global_step)
+                    self.logger.log_metrics(metrics, self.global_frame, ty='train')
 
             # take env step
             time_step = self.train_env.step(action)
             physics_agg.add(self.train_env)
             episode_reward += time_step.reward
             self.replay_loader.add(time_step, meta)
-            self.train_video_recorder.record(time_step.observation)
+            self.train_video_recorder.record(self.train_env)
             if isinstance(self.agent, agents.FBDDPGAgent):
                 z_correl += self.agent.compute_z_correl(time_step, meta)
             episode_step += 1

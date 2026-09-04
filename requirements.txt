@@ -6,6 +6,7 @@ hydra-core
 hydra-submitit-launcher
 sklearn
 pandas
+openpyxl
 matplotlib
 moviepy
 mujoco_py
