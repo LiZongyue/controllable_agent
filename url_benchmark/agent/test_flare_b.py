@@ -221,6 +221,7 @@ def test_flare_b_exact_assembly_and_asymmetric_stop_gradient() -> None:
         {"use_cls": False},
         {"dino_frame_stack": 1},
         {"goal_space": "simplified_walker"},
+        {"update_encoder": False},
     ],
 )
 def test_flare_b_rejects_invalid_configs_before_model_construction(
@@ -438,7 +439,7 @@ def test_update_routes_every_visual_b_input_through_raw_flare_features() -> None
 
 
 def test_flare_b_optimizer_owns_only_flare_and_all_optimizers_are_disjoint() -> None:
-    agent = _make_agent()
+    agent = _make_agent(lr_f=3e-4, lr_b=7e-4)
     assert agent.flare_b_encoder is not None
     assert agent.flare_b_optimizer is not None
     assert agent.fb_opt is not None
@@ -477,7 +478,158 @@ def test_flare_b_optimizer_owns_only_flare_and_all_optimizers_are_disjoint() -> 
     assert optimizer_ids["encoder_opt"] == encoder_ids
     assert optimizer_ids["actor_opt"] == actor_ids
     assert optimizer_ids["fb_opt"] == forward_ids | backward_ids
-    assert agent.flare_b_optimizer.param_groups[0]["lr"] == agent.cfg.lr_f
+    assert agent.flare_b_optimizer.param_groups[0]["lr"] == 7e-4
+
+
+def test_flare_b_optimizer_uses_effective_backward_lr_fallback() -> None:
+    agent = _make_agent(
+        lr_f=3e-4,
+        lr_b=None,
+        fb_lr=2e-4,
+        lr_coef=0.25,
+    )
+    assert agent.flare_b_optimizer is not None
+    assert agent.flare_b_optimizer.param_groups[0]["lr"] == 5e-5
+
+
+def test_init_from_warns_when_checkpoint_has_no_flare_b_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Matching 512-D BackwardMaps make this a valid intentional warm start;
+    # only the source FLARE module/optimizer are absent, as in an old checkpoint.
+    source = _make_agent(
+        dino_flare_b=False,
+        dino_adapter_output_dim=512,
+    )
+    del source.flare_b_encoder
+    del source.flare_b_optimizer
+    destination = _make_agent(dino_adapter_output_dim=512)
+    assert destination.flare_b_encoder is not None
+    assert destination.flare_b_optimizer is not None
+    flare_before = _module_parameters(destination.flare_b_encoder)
+
+    with caplog.at_level("WARNING", logger=fb_ddpg.__name__):
+        destination.init_from(source)
+
+    assert "FLARE-B remains newly initialized" in caplog.text
+    assert _module_unchanged(flare_before, destination.flare_b_encoder)
+    assert not destination.flare_b_optimizer.state_dict()["state"]
+
+
+@pytest.mark.parametrize(
+    ("optimizer_name", "source_overrides", "destination_overrides"),
+    [
+        (
+            "forward_fb_opt",
+            {
+                "dino_flare_b": False,
+                "dino_separate_fb_adapters": True,
+                "lr_f": 3e-4,
+                "lr_b": 7e-4,
+            },
+            {
+                "dino_flare_b": False,
+                "dino_separate_fb_adapters": True,
+                "lr_f": 5e-4,
+                "lr_b": 7e-4,
+            },
+        ),
+        (
+            "backward_fb_opt",
+            {
+                "dino_flare_b": False,
+                "dino_separate_fb_adapters": True,
+                "lr_f": 3e-4,
+                "lr_b": 7e-4,
+            },
+            {
+                "dino_flare_b": False,
+                "dino_separate_fb_adapters": True,
+                "lr_f": 3e-4,
+                "lr_b": 9e-4,
+            },
+        ),
+        (
+            "flare_b_optimizer",
+            {"lr_f": 3e-4, "lr_b": 7e-4},
+            {"lr_f": 3e-4, "lr_b": 9e-4},
+        ),
+        (
+            "actor_opt",
+            {"dino_flare_b": False, "lr_actor": 3e-4},
+            {"dino_flare_b": False, "lr_actor": 7e-4},
+        ),
+        (
+            "actor_opt",
+            {"dino_flare_b": False, "lr": 3e-4, "lr_actor": None},
+            {"dino_flare_b": False, "lr": 7e-4, "lr_actor": None},
+        ),
+    ],
+)
+def test_init_from_rejects_new_optimizer_lr_mismatch_before_copying(
+    optimizer_name: str,
+    source_overrides: tp.Dict[str, tp.Any],
+    destination_overrides: tp.Dict[str, tp.Any],
+) -> None:
+    torch.manual_seed(9)
+    source = _make_agent(**source_overrides)
+    torch.manual_seed(10)
+    destination = _make_agent(**destination_overrides)
+    module_snapshots = []
+    for module_name in (
+        "encoder",
+        "actor",
+        "forward_net",
+        "backward_net",
+        "flare_b_encoder",
+    ):
+        module = getattr(destination, module_name, None)
+        if module is not None:
+            module_snapshots.append((module, _module_parameters(module)))
+    destination_optimizer = getattr(destination, optimizer_name)
+    assert isinstance(destination_optimizer, torch.optim.Optimizer)
+    optimizer_lrs_before = tuple(
+        group["lr"] for group in destination_optimizer.param_groups
+    )
+    assert not destination_optimizer.state_dict()["state"]
+
+    with pytest.raises(ValueError, match=optimizer_name):
+        destination.init_from(source)
+
+    for module, parameters_before in module_snapshots:
+        assert _module_unchanged(parameters_before, module)
+    assert tuple(
+        group["lr"] for group in destination_optimizer.param_groups
+    ) == optimizer_lrs_before
+    assert not destination_optimizer.state_dict()["state"]
+
+
+def test_init_from_checks_actual_flare_optimizer_lr_groups() -> None:
+    source = _make_agent(lr_b=7e-4)
+    destination = _make_agent(lr_b=7e-4)
+    assert source.flare_b_optimizer is not None
+    source.flare_b_optimizer.param_groups[0]["lr"] = 9e-4
+
+    with pytest.raises(ValueError, match="flare_b_optimizer"):
+        destination.init_from(source)
+
+
+def test_init_from_accepts_equivalent_effective_flare_lr_and_copies_weights() -> None:
+    source = _make_agent(lr_b=None, fb_lr=7e-4, lr_coef=1.0)
+    destination = _make_agent(lr_b=7e-4)
+    assert source.flare_b_encoder is not None
+    assert destination.flare_b_encoder is not None
+    assert destination.flare_b_optimizer is not None
+    # Emulate a checkpoint created before the explicit lr_b field existed.
+    del source.cfg.lr_b
+    with torch.no_grad():
+        for parameter in source.flare_b_encoder.parameters():
+            parameter.fill_(0.125)
+
+    destination.init_from(source)
+
+    _assert_modules_equal(source.flare_b_encoder, destination.flare_b_encoder)
+    assert destination.flare_b_optimizer.param_groups[0]["lr"] == 7e-4
 
 
 def test_flare_b_and_forward_adapter_gradient_paths_are_disjoint() -> None:

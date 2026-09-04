@@ -36,6 +36,7 @@ def _make_agent(
     update_encoder=True,
     logging_enabled=True,
     lr=1e-4,
+    lr_actor=None,
 ) -> fb_ddpg.FBDDPGAgent:
     kwargs = dict(
         obs_shape=(6,),
@@ -43,6 +44,7 @@ def _make_agent(
         obs_type="dino",
         device="cpu",
         lr=lr,
+        lr_actor=lr_actor,
         num_expl_steps=0,
         goal_space=goal_space,
         use_cls=True,
@@ -833,8 +835,9 @@ def test_idm_init_from_accepts_equivalent_effective_lr_and_rejects_optimizer_lr_
 
 
 def test_idm_init_from_does_not_apply_idm_guards_to_disabled_agents() -> None:
-    source = _make_agent(idm_coef=0.0, lr=1e-4)
-    destination = _make_agent(idm_coef=0.0, lr=3e-4)
+    source = _make_agent(idm_coef=0.0, lr=1e-4, lr_actor=2e-4)
+    destination = _make_agent(idm_coef=0.0, lr=3e-4, lr_actor=2e-4)
     # There is no IDM head or IDM optimizer whose sweep configuration could be
-    # corrupted, so ordinary baseline warm-start behavior remains unchanged.
+    # corrupted. Legacy fb_opt/encoder_opt warm-start behavior remains unchanged,
+    # while actor_opt now has its separately validated effective LR held equal.
     destination.init_from(source)

@@ -328,6 +328,8 @@ class FBDDPGAgent:
             raise ValueError(
                 "dino_flare_b and dino_separate_backward_adapter are mutually exclusive"
             )
+        if cfg.dino_flare_b and not cfg.update_encoder:
+            raise ValueError("dino_flare_b requires update_encoder=True")
         if cfg.dino_flare_b and (
             cfg.obs_type != "dino"
             or not cfg.use_cls
@@ -704,7 +706,7 @@ class FBDDPGAgent:
             self.flare_b_encoder = FlareBEncoder(frame_dim).to(cfg.device)
             self.flare_b_optimizer = torch.optim.Adam(
                 self.flare_b_encoder.parameters(),
-                lr=_effective_forward_lr(cfg),
+                lr=_effective_backward_lr(cfg),
             )
         # This is an optimizer-update counter rather than an environment-step
         # counter.  Starting at zero also guarantees that sparse diagnostic
@@ -871,6 +873,38 @@ class FBDDPGAgent:
                     f"optimizer lr(s)={sorted(checkpoint_lrs)} but "
                     f"effective idm_lr={requested_idm_lr} requested"
                 )
+
+        optimizer_lrs = (
+            ("forward_fb_opt", _effective_forward_lr(self.cfg)),
+            ("backward_fb_opt", _effective_backward_lr(self.cfg)),
+            ("flare_b_optimizer", _effective_backward_lr(self.cfg)),
+            ("actor_opt", _effective_actor_lr(self.cfg)),
+        )
+        for optimizer_name, requested_lr in optimizer_lrs:
+            optimizer = getattr(self, optimizer_name, None)
+            source_optimizer = getattr(other, optimizer_name, None)
+            if not isinstance(optimizer, torch.optim.Optimizer) or not isinstance(
+                source_optimizer, torch.optim.Optimizer
+            ):
+                continue
+            checkpoint_lrs = {
+                float(group["lr"])
+                for group in source_optimizer.param_groups
+            }
+            if checkpoint_lrs != {requested_lr}:
+                raise ValueError(
+                    f"{optimizer_name} checkpoint optimizer/config mismatch: "
+                    f"optimizer lr(s)={sorted(checkpoint_lrs)} but "
+                    f"effective lr={requested_lr} requested"
+                )
+
+        flare_b_encoder = getattr(self, "flare_b_encoder", None)
+        source_flare_b_encoder = getattr(other, "flare_b_encoder", None)
+        if flare_b_encoder is not None and source_flare_b_encoder is None:
+            logger.warning(
+                "Checkpoint does not contain flare_b_encoder; "
+                "FLARE-B remains newly initialized"
+            )
         names = ["encoder", "actor"]
         if self.cfg.init_fb:
             names += ["forward_net", "backward_net", "backward_target_net", "forward_target_net"]
@@ -888,10 +922,8 @@ class FBDDPGAgent:
                 if source_backward_encoder_target is None:
                     source_backward_encoder_target = source_backward_encoder
                 utils.hard_update_params(source_backward_encoder_target, self.backward_encoder_target)
-        if self.flare_b_encoder is not None:
-            source_flare_b_encoder = getattr(other, "flare_b_encoder", None)
-            if source_flare_b_encoder is not None:
-                utils.hard_update_params(source_flare_b_encoder, self.flare_b_encoder)
+        if flare_b_encoder is not None and source_flare_b_encoder is not None:
+            utils.hard_update_params(source_flare_b_encoder, flare_b_encoder)
         if self.idm_head is not None:
             source_idm_head = getattr(other, "idm_head", None)
             if source_idm_head is not None:
