@@ -147,6 +147,135 @@ def test_wandb_resume_requires_stable_run_id() -> None:
             pretrain._init_wandb(cfg, "idm-walker-walk")
 
 
+@pytest.mark.parametrize("strict_optimizer_lr", [False, True])
+def test_load_checkpoint_routes_optimizer_lr_strictness_only_to_fb_agent(
+    tmp_path: Path,
+    strict_optimizer_lr: bool,
+) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    source = object()
+    target = object.__new__(pretrain.agents.FBDDPGAgent)
+    target.init_from = mock.Mock()
+    workspace = object.__new__(pretrain.BaseWorkspace)
+    workspace.agent = target
+    workspace.cfg = SimpleNamespace(future=0.99, discount=0.99)
+
+    with mock.patch.object(
+        pretrain.torch,
+        "load",
+        return_value={"agent": source},
+    ):
+        workspace.load_checkpoint(
+            checkpoint,
+            strict_optimizer_lr=strict_optimizer_lr,
+        )
+
+    target.init_from.assert_called_once_with(
+        source,
+        strict_optimizer_lr=strict_optimizer_lr,
+    )
+
+    other_target = SimpleNamespace(init_from=mock.Mock())
+    workspace.agent = other_target
+    with mock.patch.object(
+        pretrain.torch,
+        "load",
+        return_value={"agent": source},
+    ):
+        workspace.load_checkpoint(
+            checkpoint,
+            strict_optimizer_lr=strict_optimizer_lr,
+        )
+    other_target.init_from.assert_called_once_with(source)
+
+
+@pytest.mark.parametrize(
+    ("auto_resume", "load_model", "expected_args", "expected_kwargs"),
+    [
+        (True, "warm-start.pt", (), {"strict_optimizer_lr": True}),
+        (
+            False,
+            "warm-start.pt",
+            ("warm-start.pt",),
+            {
+                "exclude": ["replay_loader"],
+                "strict_optimizer_lr": False,
+            },
+        ),
+    ],
+)
+def test_workspace_routes_resume_strictness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auto_resume: bool,
+    load_model: tp.Optional[str],
+    expected_args: tp.Tuple[tp.Any, ...],
+    expected_kwargs: tp.Dict[str, tp.Any],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    resume_checkpoint = tmp_path / "models" / "latest.pt"
+    if auto_resume:
+        resume_checkpoint.parent.mkdir()
+        resume_checkpoint.write_bytes(b"checkpoint")
+        expected_args = (resume_checkpoint,)
+
+    cfg = SimpleNamespace(
+        seed=1,
+        device="cpu",
+        agent=SimpleNamespace(name="fb_ddpg", device="cpu", idm_coef=0.0),
+        task="walker_walk",
+        obs_type="states",
+        num_seed_frames=0,
+        action_repeat=1,
+        use_tb=False,
+        use_wandb=False,
+        use_hiplog=False,
+        goal_space=None,
+        replay_buffer_episodes=1,
+        discount=0.99,
+        future=0.99,
+        save_video=False,
+        checkpoint_root=None,
+        auto_resume=auto_resume,
+        load_model=load_model,
+        custom_reward=None,
+    )
+    env = SimpleNamespace(
+        observation_spec=lambda: object(),
+        action_spec=lambda: object(),
+    )
+    load_checkpoint = mock.Mock()
+    with mock.patch.object(
+        pretrain.BaseWorkspace,
+        "_make_env",
+        return_value=env,
+    ), mock.patch.object(
+        pretrain.BaseWorkspace,
+        "load_checkpoint",
+        load_checkpoint,
+    ), mock.patch.object(
+        pretrain,
+        "make_agent",
+        return_value=object(),
+    ), mock.patch.object(
+        pretrain,
+        "Logger",
+        return_value=object(),
+    ), mock.patch.object(
+        pretrain,
+        "ReplayBuffer",
+        return_value=object(),
+    ), mock.patch.object(
+        pretrain,
+        "VideoRecorder",
+        return_value=object(),
+    ):
+        pretrain.BaseWorkspace(cfg)
+
+    load_checkpoint.assert_called_once_with(*expected_args, **expected_kwargs)
+
+
 @pytest.mark.parametrize(
     ("idm_coef", "idm_lr", "expected_run_id", "expected_suffix"),
     [

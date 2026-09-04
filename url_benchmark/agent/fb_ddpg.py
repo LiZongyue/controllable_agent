@@ -328,8 +328,6 @@ class FBDDPGAgent:
             raise ValueError(
                 "dino_flare_b and dino_separate_backward_adapter are mutually exclusive"
             )
-        if cfg.dino_flare_b and not cfg.update_encoder:
-            raise ValueError("dino_flare_b requires update_encoder=True")
         if cfg.dino_flare_b and (
             cfg.obs_type != "dino"
             or not cfg.use_cls
@@ -383,7 +381,11 @@ class FBDDPGAgent:
                     "pixel_separate_fb_encoders cannot be combined with a "
                     "separate DINO adapter mode"
                 )
-        if cfg.dino_separate_fb_adapters and not cfg.update_encoder:
+        if (
+            cfg.dino_separate_fb_adapters
+            and not cfg.update_encoder
+            and not cfg.dino_flare_b
+        ):
             raise ValueError(
                 "dino_separate_fb_adapters requires update_encoder=True so both "
                 "adapters remain trainable"
@@ -743,7 +745,12 @@ class FBDDPGAgent:
         for net in nets:
             net.train(training)
 
-    def init_from(self, other) -> None:
+    def init_from(
+        self,
+        other,
+        *,
+        strict_optimizer_lr: bool = False,
+    ) -> None:
         # copy parameters over
         source_cfg = getattr(other, "cfg", None)
         # A pre-IDM pickle has no instance fields for either option.  Testing
@@ -874,29 +881,32 @@ class FBDDPGAgent:
                     f"effective idm_lr={requested_idm_lr} requested"
                 )
 
-        optimizer_lrs = (
-            ("forward_fb_opt", _effective_forward_lr(self.cfg)),
-            ("backward_fb_opt", _effective_backward_lr(self.cfg)),
-            ("flare_b_optimizer", _effective_backward_lr(self.cfg)),
-            ("actor_opt", _effective_actor_lr(self.cfg)),
-        )
-        for optimizer_name, requested_lr in optimizer_lrs:
-            optimizer = getattr(self, optimizer_name, None)
-            source_optimizer = getattr(other, optimizer_name, None)
-            if not isinstance(optimizer, torch.optim.Optimizer) or not isinstance(
-                source_optimizer, torch.optim.Optimizer
-            ):
-                continue
-            checkpoint_lrs = {
-                float(group["lr"])
-                for group in source_optimizer.param_groups
-            }
-            if checkpoint_lrs != {requested_lr}:
-                raise ValueError(
-                    f"{optimizer_name} checkpoint optimizer/config mismatch: "
-                    f"optimizer lr(s)={sorted(checkpoint_lrs)} but "
-                    f"effective lr={requested_lr} requested"
+        if strict_optimizer_lr:
+            fb_lr = _effective_fb_lr(self.cfg)
+            optimizer_lrs = (
+                ("fb_opt", (fb_lr, self.cfg.lr_coef * fb_lr)),
+                ("forward_fb_opt", (_effective_forward_lr(self.cfg),)),
+                ("backward_fb_opt", (_effective_backward_lr(self.cfg),)),
+                ("flare_b_optimizer", (_effective_backward_lr(self.cfg),)),
+                ("actor_opt", (_effective_actor_lr(self.cfg),)),
+            )
+            for optimizer_name, requested_lrs in optimizer_lrs:
+                optimizer = getattr(self, optimizer_name, None)
+                source_optimizer = getattr(other, optimizer_name, None)
+                if not isinstance(optimizer, torch.optim.Optimizer) or not isinstance(
+                    source_optimizer, torch.optim.Optimizer
+                ):
+                    continue
+                checkpoint_lrs = tuple(
+                    float(group["lr"])
+                    for group in source_optimizer.param_groups
                 )
+                if checkpoint_lrs != requested_lrs:
+                    raise ValueError(
+                        f"{optimizer_name} checkpoint optimizer/config mismatch: "
+                        f"optimizer lr(s)={checkpoint_lrs} but "
+                        f"effective lr(s)={requested_lrs} requested"
+                    )
 
         flare_b_encoder = getattr(self, "flare_b_encoder", None)
         source_flare_b_encoder = getattr(other, "flare_b_encoder", None)
@@ -928,11 +938,29 @@ class FBDDPGAgent:
             source_idm_head = getattr(other, "idm_head", None)
             if source_idm_head is not None:
                 utils.hard_update_params(source_idm_head, self.idm_head)
+        preserve_destination_lrs = {
+            "fb_opt",
+            "forward_fb_opt",
+            "backward_fb_opt",
+            "flare_b_optimizer",
+            "actor_opt",
+        }
         for key, val in self.__dict__.items():
             if isinstance(val, torch.optim.Optimizer):
                 source_opt = getattr(other, key, None)
                 if isinstance(source_opt, torch.optim.Optimizer):
-                    val.load_state_dict(copy.deepcopy(source_opt.state_dict()))
+                    if not strict_optimizer_lr and key in preserve_destination_lrs:
+                        destination_lrs = [
+                            copy.deepcopy(group["lr"])
+                            for group in val.param_groups
+                        ]
+                        try:
+                            val.load_state_dict(copy.deepcopy(source_opt.state_dict()))
+                        finally:
+                            for group, lr in zip(val.param_groups, destination_lrs):
+                                group["lr"] = lr
+                    else:
+                        val.load_state_dict(copy.deepcopy(source_opt.state_dict()))
         self._idm_update_count = int(getattr(other, "_idm_update_count", 0))
         if self.cfg.idm_encoder_mode == "balanced":
             self._idm_effective_coef = float(other._idm_effective_coef)
@@ -1715,8 +1743,7 @@ class FBDDPGAgent:
             if not self.cfg.update_encoder:
                 obs = obs.detach()
                 next_obs = next_obs.detach()
-                if flare_b_encoder is None:
-                    next_goal = next_goal.detach()
+                next_goal = next_goal.detach()
                 target_next_goal = target_next_goal.detach()
 
         # if len(batch.meta) == 1 and batch.meta[0].shape[-1] == self.cfg.z_dim:
@@ -1753,7 +1780,7 @@ class FBDDPGAgent:
             elif backward_input[-1].ndim != 1:
                 backward_input = self.aug_and_encode(backward_input)
                 future_goal = self.aug_and_encode(future_goal)
-            if not self.cfg.update_encoder and flare_b_encoder is None:
+            if not self.cfg.update_encoder:
                 backward_input = backward_input.detach()
                 future_goal = future_goal.detach()
 

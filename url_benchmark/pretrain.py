@@ -408,9 +408,16 @@ class BaseWorkspace(tp.Generic[C]):
                     self._resume_checkpoint_filepath = candidate
                     break
         if self._resume_checkpoint_filepath is not None:
-            self.load_checkpoint(self._resume_checkpoint_filepath)
+            self.load_checkpoint(
+                self._resume_checkpoint_filepath,
+                strict_optimizer_lr=True,
+            )
         elif cfg.load_model is not None:
-            self.load_checkpoint(cfg.load_model, exclude=["replay_loader"])
+            self.load_checkpoint(
+                cfg.load_model,
+                exclude=["replay_loader"],
+                strict_optimizer_lr=False,
+            )
 
         self.reward_cls: tp.Optional[_goals.BaseReward] = None
         if self.cfg.custom_reward == "maze_multi_goal":
@@ -577,7 +584,14 @@ class BaseWorkspace(tp.Generic[C]):
             if tmp_fp.exists():
                 tmp_fp.unlink()
 
-    def load_checkpoint(self, fp: tp.Union[Path, str], only: tp.Optional[tp.Sequence[str]] = None, exclude: tp.Sequence[str] = ()) -> None:
+    def load_checkpoint(
+        self,
+        fp: tp.Union[Path, str],
+        only: tp.Optional[tp.Sequence[str]] = None,
+        exclude: tp.Sequence[str] = (),
+        *,
+        strict_optimizer_lr: bool = False,
+    ) -> None:
         """Reloads a checkpoint or part of it
 
         Parameters
@@ -586,6 +600,8 @@ class BaseWorkspace(tp.Generic[C]):
             reloads only a specific subset (defaults to all)
         exclude: sequence of str
             does not reload the provided keys
+        strict_optimizer_lr: bool
+            validates FB/DDPG optimizer learning rates for a true resume
         """
         print(f"loading checkpoint from {fp}")
         fp = Path(fp)
@@ -609,7 +625,13 @@ class BaseWorkspace(tp.Generic[C]):
         for name, val in payload.items():
             logger.info("Reloading %s from %s", name, fp)
             if name == "agent":
-                self.agent.init_from(val)
+                if isinstance(self.agent, agents.FBDDPGAgent):
+                    self.agent.init_from(
+                        val,
+                        strict_optimizer_lr=strict_optimizer_lr,
+                    )
+                else:
+                    self.agent.init_from(val)
             elif name == "replay_loader":
                 _update_legacy_class(val, (ReplayBuffer,))
                 assert isinstance(val, ReplayBuffer)

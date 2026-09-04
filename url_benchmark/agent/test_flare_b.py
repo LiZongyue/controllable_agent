@@ -97,6 +97,39 @@ def _assert_modules_equal(left: nn.Module, right: nn.Module) -> None:
         torch.testing.assert_close(expected, right_state[name], rtol=0, atol=0)
 
 
+def _prime_optimizer(optimizer: torch.optim.Optimizer) -> None:
+    optimizer.zero_grad(set_to_none=True)
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            parameter.grad = torch.full_like(parameter, 0.25)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def _assert_optimizer_state_equal(
+    expected: torch.optim.Optimizer,
+    actual: torch.optim.Optimizer,
+) -> None:
+    expected_state = expected.state_dict()["state"]
+    actual_state = actual.state_dict()["state"]
+    assert expected_state
+    assert expected_state.keys() == actual_state.keys()
+    for parameter_id, expected_fields in expected_state.items():
+        actual_fields = actual_state[parameter_id]
+        assert expected_fields.keys() == actual_fields.keys()
+        for field, expected_value in expected_fields.items():
+            actual_value = actual_fields[field]
+            if isinstance(expected_value, torch.Tensor):
+                torch.testing.assert_close(
+                    expected_value,
+                    actual_value,
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                assert expected_value == actual_value
+
+
 def _fixed_raw_batch(offset: float = 0.0) -> torch.Tensor:
     values = torch.arange(_BATCH_SIZE * _RAW_DIM, dtype=torch.float32)
     return values.reshape(_BATCH_SIZE, _RAW_DIM) / 17.0 + offset
@@ -221,7 +254,6 @@ def test_flare_b_exact_assembly_and_asymmetric_stop_gradient() -> None:
         {"use_cls": False},
         {"dino_frame_stack": 1},
         {"goal_space": "simplified_walker"},
-        {"update_encoder": False},
     ],
 )
 def test_flare_b_rejects_invalid_configs_before_model_construction(
@@ -232,6 +264,43 @@ def test_flare_b_rejects_invalid_configs_before_model_construction(
     with pytest.raises(ValueError, match="dino_flare_b"):
         _make_agent(**override)
     torch.testing.assert_close(torch.get_rng_state(), rng_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("separate_fb_adapters", [False, True])
+def test_flare_b_constructs_with_encoder_updates_disabled(
+    separate_fb_adapters: bool,
+) -> None:
+    agent = _make_agent(
+        update_encoder=False,
+        dino_separate_fb_adapters=separate_fb_adapters,
+    )
+
+    assert agent.cfg.update_encoder is False
+    assert agent.flare_b_encoder is not None
+    assert agent.flare_b_optimizer is not None
+    with torch.no_grad():
+        encoded = agent.backward_aug_and_encode(_fixed_raw_batch())
+    assert encoded.shape == (_BATCH_SIZE, 512)
+
+
+def test_flare_b_checkpoint_loads_with_encoder_updates_disabled() -> None:
+    torch.manual_seed(31)
+    source = _make_agent(update_encoder=True)
+    torch.manual_seed(32)
+    destination = _make_agent(update_encoder=False)
+    assert source.flare_b_encoder is not None
+    assert destination.flare_b_encoder is not None
+    with torch.no_grad():
+        for parameter in source.flare_b_encoder.parameters():
+            parameter.fill_(0.125)
+
+    destination.init_from(source)
+
+    assert destination.cfg.update_encoder is False
+    _assert_modules_equal(source.flare_b_encoder, destination.flare_b_encoder)
+    with torch.no_grad():
+        encoded = destination.backward_aug_and_encode(_fixed_raw_batch())
+    assert encoded.shape == (_BATCH_SIZE, 512)
 
 
 def test_flare_b_rejects_legacy_backward_adapter_before_construction() -> None:
@@ -338,9 +407,16 @@ class _Replay:
         return self.batch
 
 
-def test_update_routes_every_visual_b_input_through_raw_flare_features() -> None:
+@pytest.mark.parametrize("update_encoder", [True, False])
+def test_update_routes_every_visual_b_input_through_raw_flare_features(
+    update_encoder: bool,
+) -> None:
     torch.manual_seed(6)
-    agent = _make_agent(mix_ratio=1.0, future_ratio=1.0)
+    agent = _make_agent(
+        mix_ratio=1.0,
+        future_ratio=1.0,
+        update_encoder=update_encoder,
+    )
     assert agent.flare_b_encoder is not None
     raw_obs = _fixed_raw_batch(0.0).numpy()
     raw_next_obs = _fixed_raw_batch(10.0).numpy()
@@ -415,6 +491,7 @@ def test_update_routes_every_visual_b_input_through_raw_flare_features() -> None
         torch.equal(routed["next_goal"], output)
         for output in next_flare_outputs
     )
+    assert routed["next_goal"].requires_grad is update_encoder
     assert not routed["target_next_goal"].requires_grad
     assert any(
         torch.equal(routed["target_next_goal"], output.detach())
@@ -434,6 +511,18 @@ def test_update_routes_every_visual_b_input_through_raw_flare_features() -> None
         for actual in backward_map_inputs
         for output in future_flare_outputs
     )
+    matching_future_inputs = [
+        actual
+        for actual in backward_map_inputs
+        if any(torch.equal(actual, output) for output in future_flare_outputs)
+    ]
+    assert matching_future_inputs
+    if update_encoder:
+        # The mixed-current input is sliced inside torch.no_grad(), whereas the
+        # future-goal input reaches BackwardMap while still attached.
+        assert any(actual.requires_grad for actual in matching_future_inputs)
+    else:
+        assert all(not actual.requires_grad for actual in backward_map_inputs)
     actor_obs = update_actor.call_args.args[0]
     torch.testing.assert_close(actor_obs, forward_records[0][1].detach())
 
@@ -555,14 +644,34 @@ def test_init_from_warns_when_checkpoint_has_no_flare_b_state(
             {"lr_f": 3e-4, "lr_b": 9e-4},
         ),
         (
+            "fb_opt",
+            {"fb_lr": 3e-4, "lr_coef": 2.0, "lr_b": 7e-4},
+            {"fb_lr": 6e-4, "lr_coef": 1.0, "lr_b": 7e-4},
+        ),
+        (
+            "fb_opt",
+            {"fb_lr": 3e-4, "lr_coef": 0.5, "lr_b": 7e-4},
+            {"fb_lr": 3e-4, "lr_coef": 0.75, "lr_b": 7e-4},
+        ),
+        (
             "actor_opt",
             {"dino_flare_b": False, "lr_actor": 3e-4},
             {"dino_flare_b": False, "lr_actor": 7e-4},
         ),
         (
             "actor_opt",
-            {"dino_flare_b": False, "lr": 3e-4, "lr_actor": None},
-            {"dino_flare_b": False, "lr": 7e-4, "lr_actor": None},
+            {
+                "dino_flare_b": False,
+                "lr": 3e-4,
+                "lr_actor": None,
+                "fb_lr": 1e-4,
+            },
+            {
+                "dino_flare_b": False,
+                "lr": 7e-4,
+                "lr_actor": None,
+                "fb_lr": 1e-4,
+            },
         ),
     ],
 )
@@ -594,7 +703,7 @@ def test_init_from_rejects_new_optimizer_lr_mismatch_before_copying(
     assert not destination_optimizer.state_dict()["state"]
 
     with pytest.raises(ValueError, match=optimizer_name):
-        destination.init_from(source)
+        destination.init_from(source, strict_optimizer_lr=True)
 
     for module, parameters_before in module_snapshots:
         assert _module_unchanged(parameters_before, module)
@@ -604,6 +713,52 @@ def test_init_from_rejects_new_optimizer_lr_mismatch_before_copying(
     assert not destination_optimizer.state_dict()["state"]
 
 
+def test_init_from_strict_lr_failure_is_atomic() -> None:
+    source = _make_agent(
+        fb_lr=2e-4,
+        lr_coef=0.5,
+        lr_b=7e-4,
+        lr_actor=3e-4,
+    )
+    destination = _make_agent(
+        fb_lr=2e-4,
+        lr_coef=0.5,
+        lr_b=7e-4,
+        lr_actor=6e-4,
+    )
+    for value in vars(source).values():
+        if isinstance(value, torch.optim.Optimizer):
+            _prime_optimizer(value)
+
+    module_snapshots = {
+        module_name: _module_parameters(getattr(destination, module_name))
+        for module_name in (
+            "encoder",
+            "actor",
+            "forward_net",
+            "backward_net",
+            "forward_target_net",
+            "backward_target_net",
+            "flare_b_encoder",
+        )
+    }
+    optimizer_snapshots = {
+        optimizer_name: tuple(group["lr"] for group in optimizer.param_groups)
+        for optimizer_name, optimizer in vars(destination).items()
+        if isinstance(optimizer, torch.optim.Optimizer)
+    }
+
+    with pytest.raises(ValueError, match="actor_opt"):
+        destination.init_from(source, strict_optimizer_lr=True)
+
+    for module_name, parameters_before in module_snapshots.items():
+        assert _module_unchanged(parameters_before, getattr(destination, module_name))
+    for optimizer_name, lrs_before in optimizer_snapshots.items():
+        optimizer = getattr(destination, optimizer_name)
+        assert tuple(group["lr"] for group in optimizer.param_groups) == lrs_before
+        assert not optimizer.state_dict()["state"]
+
+
 def test_init_from_checks_actual_flare_optimizer_lr_groups() -> None:
     source = _make_agent(lr_b=7e-4)
     destination = _make_agent(lr_b=7e-4)
@@ -611,12 +766,12 @@ def test_init_from_checks_actual_flare_optimizer_lr_groups() -> None:
     source.flare_b_optimizer.param_groups[0]["lr"] = 9e-4
 
     with pytest.raises(ValueError, match="flare_b_optimizer"):
-        destination.init_from(source)
+        destination.init_from(source, strict_optimizer_lr=True)
 
 
 def test_init_from_accepts_equivalent_effective_flare_lr_and_copies_weights() -> None:
     source = _make_agent(lr_b=None, fb_lr=7e-4, lr_coef=1.0)
-    destination = _make_agent(lr_b=7e-4)
+    destination = _make_agent(lr_b=7e-4, fb_lr=7e-4, lr_coef=1.0)
     assert source.flare_b_encoder is not None
     assert destination.flare_b_encoder is not None
     assert destination.flare_b_optimizer is not None
@@ -626,10 +781,155 @@ def test_init_from_accepts_equivalent_effective_flare_lr_and_copies_weights() ->
         for parameter in source.flare_b_encoder.parameters():
             parameter.fill_(0.125)
 
-    destination.init_from(source)
+    destination.init_from(source, strict_optimizer_lr=True)
 
     _assert_modules_equal(source.flare_b_encoder, destination.flare_b_encoder)
     assert destination.flare_b_optimizer.param_groups[0]["lr"] == 7e-4
+
+
+def test_init_from_strict_accepts_matching_default_fb_optimizer_lrs() -> None:
+    torch.manual_seed(33)
+    source = _make_agent(fb_lr=3e-4, lr_coef=0.5, lr_b=7e-4)
+    torch.manual_seed(34)
+    destination = _make_agent(fb_lr=3e-4, lr_coef=0.5, lr_b=7e-4)
+    assert source.fb_opt is not None
+    assert destination.fb_opt is not None
+    _prime_optimizer(source.fb_opt)
+
+    destination.init_from(source, strict_optimizer_lr=True)
+
+    assert tuple(group["lr"] for group in destination.fb_opt.param_groups) == (
+        3e-4,
+        1.5e-4,
+    )
+    _assert_modules_equal(source.forward_net, destination.forward_net)
+    _assert_modules_equal(source.backward_net, destination.backward_net)
+    _assert_optimizer_state_equal(source.fb_opt, destination.fb_opt)
+
+
+@pytest.mark.parametrize(
+    "checkpoint_lrs",
+    [
+        (9e-4, 1.5e-4),
+        (3e-4, 9e-4),
+        (1.5e-4, 3e-4),
+    ],
+    ids=("forward-group", "backward-group", "swapped-order"),
+)
+def test_init_from_strict_checks_actual_ordered_fb_optimizer_lrs(
+    checkpoint_lrs: tp.Tuple[float, float],
+) -> None:
+    source = _make_agent(fb_lr=3e-4, lr_coef=0.5, lr_b=7e-4)
+    destination = _make_agent(fb_lr=3e-4, lr_coef=0.5, lr_b=7e-4)
+    assert source.fb_opt is not None
+    assert destination.fb_opt is not None
+    for group, checkpoint_lr in zip(source.fb_opt.param_groups, checkpoint_lrs):
+        group["lr"] = checkpoint_lr
+    destination_before = _module_parameters(destination.forward_net)
+    destination_lrs_before = tuple(
+        group["lr"] for group in destination.fb_opt.param_groups
+    )
+
+    with pytest.raises(ValueError, match="fb_opt"):
+        destination.init_from(source, strict_optimizer_lr=True)
+
+    assert _module_unchanged(destination_before, destination.forward_net)
+    assert tuple(
+        group["lr"] for group in destination.fb_opt.param_groups
+    ) == destination_lrs_before
+    assert not destination.fb_opt.state_dict()["state"]
+
+
+@pytest.mark.parametrize(
+    ("source_overrides", "destination_overrides", "optimizer_names"),
+    [
+        (
+            {
+                "fb_lr": 2e-4,
+                "lr_coef": 0.25,
+                "lr_b": 7e-4,
+                "lr_actor": 3e-4,
+            },
+            {
+                "fb_lr": 5e-4,
+                "lr_coef": 0.4,
+                "lr_b": 9e-4,
+                "lr_actor": 6e-4,
+            },
+            ("actor_opt", "fb_opt", "flare_b_optimizer"),
+        ),
+        (
+            {
+                "dino_separate_fb_adapters": True,
+                "lr_f": 3e-4,
+                "lr_b": 7e-4,
+                "lr_actor": 4e-4,
+            },
+            {
+                "dino_separate_fb_adapters": True,
+                "lr_f": 5e-4,
+                "lr_b": 9e-4,
+                "lr_actor": 6e-4,
+            },
+            (
+                "actor_opt",
+                "forward_fb_opt",
+                "backward_fb_opt",
+                "flare_b_optimizer",
+            ),
+        ),
+    ],
+    ids=("default-fb-opt", "separate-fb-optimizers"),
+)
+def test_init_from_non_strict_preserves_destination_lrs_and_loads_state(
+    source_overrides: tp.Dict[str, tp.Any],
+    destination_overrides: tp.Dict[str, tp.Any],
+    optimizer_names: tp.Tuple[str, ...],
+) -> None:
+    torch.manual_seed(35)
+    source = _make_agent(**source_overrides)
+    torch.manual_seed(36)
+    destination = _make_agent(**destination_overrides)
+
+    source_optimizers: tp.Dict[str, torch.optim.Optimizer] = {}
+    destination_optimizers: tp.Dict[str, torch.optim.Optimizer] = {}
+    destination_lrs: tp.Dict[str, tp.Tuple[float, ...]] = {}
+    for optimizer_name in optimizer_names:
+        source_optimizer = getattr(source, optimizer_name)
+        destination_optimizer = getattr(destination, optimizer_name)
+        assert isinstance(source_optimizer, torch.optim.Optimizer)
+        assert isinstance(destination_optimizer, torch.optim.Optimizer)
+        _prime_optimizer(source_optimizer)
+        source_optimizers[optimizer_name] = source_optimizer
+        destination_optimizers[optimizer_name] = destination_optimizer
+        destination_lrs[optimizer_name] = tuple(
+            group["lr"] for group in destination_optimizer.param_groups
+        )
+
+    destination.init_from(source)
+
+    for optimizer_name in optimizer_names:
+        destination_optimizer = destination_optimizers[optimizer_name]
+        assert tuple(
+            group["lr"] for group in destination_optimizer.param_groups
+        ) == destination_lrs[optimizer_name]
+        _assert_optimizer_state_equal(
+            source_optimizers[optimizer_name],
+            destination_optimizer,
+        )
+    for module_name in (
+        "encoder",
+        "actor",
+        "forward_net",
+        "backward_net",
+        "forward_target_net",
+        "backward_target_net",
+        "flare_b_encoder",
+    ):
+        _assert_modules_equal(
+            getattr(source, module_name),
+            getattr(destination, module_name),
+        )
 
 
 def test_flare_b_and_forward_adapter_gradient_paths_are_disjoint() -> None:
@@ -685,46 +985,52 @@ def test_flare_b_replaces_plural_backward_adapter_without_changing_map_owners() 
     assert _optimizer_parameter_ids(agent.backward_fb_opt) == backward_map_ids
 
 
-def test_flare_b_optimizer_steps_during_one_fb_update() -> None:
+@pytest.mark.parametrize(
+    ("update_encoder", "expect_flare_update"),
+    [(False, False), (True, True)],
+)
+def test_full_update_respects_flare_b_encoder_freeze(
+    update_encoder: bool,
+    expect_flare_update: bool,
+) -> None:
     torch.manual_seed(7)
-    agent = _make_agent()
+    agent = _make_agent(update_encoder=update_encoder, norm_z=False)
     assert agent.flare_b_encoder is not None
     assert agent.flare_b_optimizer is not None
     assert agent.fb_opt is not None
-    raw_obs = _fixed_raw_batch(0.25)
-    raw_next_obs = _fixed_raw_batch(1.25)
-    obs = agent.aug_and_encode(raw_obs)
-    next_obs = agent.aug_and_encode(raw_next_obs)
-    next_goal = agent.backward_aug_and_encode(raw_next_obs)
-    generator = torch.Generator().manual_seed(77)
-    action = torch.randn(_BATCH_SIZE, agent.action_dim, generator=generator).tanh()
-    discount = torch.full((_BATCH_SIZE, 1), 0.99)
-    z = torch.randn(_BATCH_SIZE, agent.cfg.z_dim, generator=generator)
+    batch = rb.EpisodeBatch(
+        obs=_fixed_raw_batch(0.25).numpy(),
+        action=np.linspace(
+            -0.8,
+            0.8,
+            _BATCH_SIZE * agent.action_dim,
+            dtype=np.float32,
+        ).reshape(_BATCH_SIZE, agent.action_dim),
+        reward=np.zeros((_BATCH_SIZE, 1), dtype=np.float32),
+        next_obs=_fixed_raw_batch(1.25).numpy(),
+        discount=np.full((_BATCH_SIZE, 1), 0.99, dtype=np.float32),
+        future_obs=_fixed_raw_batch(2.25).numpy(),
+    )
     flare_before = _module_parameters(agent.flare_b_encoder)
-    backward_before = _module_parameters(agent.backward_net)
-    actor_before = _module_parameters(agent.actor)
-
-    with mock.patch.object(
-        agent.flare_b_optimizer,
-        "step",
-        wraps=agent.flare_b_optimizer.step,
-    ) as flare_step:
-        agent.update_fb(
-            obs=obs,
-            action=action,
-            discount=discount,
-            next_obs=next_obs,
-            next_goal=next_goal,
-            target_next_goal=next_goal.detach(),
-            z=z,
-            step=0,
+    flare_gradients: tp.List[torch.Tensor] = []
+    gradient_hooks = [
+        parameter.register_hook(
+            lambda gradient: flare_gradients.append(gradient.detach().clone())
         )
+        for parameter in agent.flare_b_encoder.parameters()
+    ]
 
-    assert flare_step.call_count == 1
-    assert _module_changed(flare_before, agent.flare_b_encoder)
-    assert _module_changed(backward_before, agent.backward_net)
-    assert _module_unchanged(actor_before, agent.actor)
-    assert agent.flare_b_optimizer.state_dict()["state"]
+    try:
+        agent.update(_Replay(batch), step=0)  # type: ignore[arg-type]
+    finally:
+        for hook in gradient_hooks:
+            hook.remove()
+
+    assert _module_changed(flare_before, agent.flare_b_encoder) is expect_flare_update
+    has_flare_gradient = any(
+        torch.count_nonzero(gradient) for gradient in flare_gradients
+    )
+    assert has_flare_gradient is expect_flare_update
 
 
 def test_disabled_flare_b_is_an_rng_and_routing_noop() -> None:
