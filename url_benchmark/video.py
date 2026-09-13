@@ -11,6 +11,28 @@ import numpy as np
 import wandb
 
 
+def _frame_from_source(source: tp.Any, render_size: int, camera_id: int) -> tp.Optional[np.ndarray]:
+    if isinstance(source, np.ndarray):
+        frame = source
+        if frame.ndim != 3:
+            return None
+        if frame.shape[0] >= 3:
+            frame = frame[-3:].transpose(1, 2, 0)
+        elif frame.shape[-1] != 3:
+            return None
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return cv2.resize(frame, dsize=(render_size, render_size), interpolation=cv2.INTER_CUBIC)
+
+    if hasattr(source, 'physics') and source.physics is not None:
+        return source.physics.render(height=render_size, width=render_size, camera_id=camera_id)
+    if hasattr(source, 'base_env') and hasattr(source.base_env, 'render'):
+        return source.base_env.render()
+    if hasattr(source, 'render'):
+        return source.render()
+    return None
+
+
 class VideoRecorder:
     def __init__(self,
                  root_dir: tp.Optional[tp.Union[str, Path]],
@@ -36,16 +58,9 @@ class VideoRecorder:
 
     def record(self, env) -> None:
         if self.enabled:
-            if hasattr(env, 'physics'):
-                if env.physics is not None:
-                    frame = env.physics.render(height=self.render_size,
-                                               width=self.render_size,
-                                               camera_id=self.camera_id)
-                else:
-                    frame = env.base_env.render()
-            else:
-                frame = env.render()
-            self.frames.append(frame)
+            frame = _frame_from_source(env, self.render_size, self.camera_id)
+            if frame is not None:
+                self.frames.append(frame)
 
     def log_to_wandb(self) -> None:
         frames = np.transpose(np.array(self.frames), (0, 3, 1, 2))
@@ -83,17 +98,16 @@ class TrainVideoRecorder:
         self.camera_id = camera_id
         self.use_wandb = use_wandb
 
-    def init(self, obs, enabled=True) -> None:
+    def init(self, source, enabled=True) -> None:
         self.frames = []
         self.enabled = self.save_dir is not None and enabled
-        self.record(obs)
+        self.record(source)
 
-    def record(self, obs) -> None:
+    def record(self, source) -> None:
         if self.enabled:
-            frame = cv2.resize(obs[-3:].transpose(1, 2, 0),
-                               dsize=(self.render_size, self.render_size),
-                               interpolation=cv2.INTER_CUBIC)
-            self.frames.append(frame)
+            frame = _frame_from_source(source, self.render_size, self.camera_id)
+            if frame is not None:
+                self.frames.append(frame)
 
     def log_to_wandb(self) -> None:
         frames = np.transpose(np.array(self.frames), (0, 3, 1, 2))
