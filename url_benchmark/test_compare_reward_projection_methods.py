@@ -10,6 +10,10 @@ from scripts.compare_reward_projection_methods import (
     validate_projection_provenance,
 )
 
+# REDUNDANCY REVIEW: exercises scripts/compare_reward_projection_methods.py, a standalone
+# post-hoc analysis script that pretrain.py never imports and no launch_*.sh calls. Tests
+# real logic, but the logic itself is analysis tooling, not the training pipeline.
+
 
 def _row(
     task,

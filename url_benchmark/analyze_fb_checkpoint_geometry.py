@@ -17,11 +17,15 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import gc
 import hashlib
+import inspect
 import json
 import math
 import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -711,10 +715,13 @@ def drift_metrics(
     return output
 
 
-def nearest_evaluation(eval_rows: Sequence[Mapping[str, float]], frame: int) -> Mapping[str, float]:
-    # min is stable, so sorting by frame first makes ties prefer the earlier eval.
-    ordered = sorted(eval_rows, key=lambda row: row["frame"])
-    return min(ordered, key=lambda row: (abs(row["frame"] - frame), row["frame"]))
+def exact_evaluation(eval_rows: Sequence[Mapping[str, float]], frame: int) -> Mapping[str, float]:
+    matches = [row for row in eval_rows if row["frame"] == frame]
+    values = {(row["reward"], row["reward_std"]) for row in matches}
+    if len(values) == 1 and all(np.isfinite(value) for value in next(iter(values))):
+        return matches[0]
+    # Missing or conflicting resumed evaluations are never nearest-matched.
+    return {"frame": float("nan"), "reward": float("nan"), "reward_std": float("nan")}
 
 
 def read_evaluations(path: Path) -> List[Dict[str, float]]:
@@ -780,7 +787,7 @@ def analyze_checkpoint(
     )
     q1 = np.einsum("nd,nd->n", f1, batch.z.astype(np.float64))
     q2 = np.einsum("nd,nd->n", f2, batch.z.astype(np.float64))
-    nearest = nearest_evaluation(eval_rows, expected_frame)
+    evaluation = exact_evaluation(eval_rows, expected_frame)
     stat = checkpoint.stat()
     row: Dict[str, Any] = {
         "run_id": "dino_cls3_cheetah_walk_seed1-paramgrad",
@@ -791,10 +798,10 @@ def analyze_checkpoint(
         "global_step": info["global_step"],
         "global_episode": info["global_episode"],
         "derived_frame_from_global_step": 2 * info["global_step"],
-        "eval_frame": int(nearest["frame"]),
-        "eval_frame_delta": int(nearest["frame"] - expected_frame),
-        "eval_reward": float(nearest["reward"]),
-        "eval_reward_std": float(nearest["reward_std"]),
+        "eval_frame": evaluation["frame"],
+        "eval_frame_delta": evaluation["frame"] - expected_frame,
+        "eval_reward": evaluation["reward"],
+        "eval_reward_std": evaluation["reward_std"],
         "fixed_batch_size": batch.obs.shape[0],
         "fixed_batch_sha256": batch.metadata["batch_sha256"],
         "fixed_batch_source": "exorl_rnd_proxy",
@@ -857,7 +864,7 @@ def plot_geometry(rows: Sequence[Mapping[str, Any]], output: Path) -> None:
 
     ax = axes[0, 0]
     ax.errorbar(frames, rewards, yerr=reward_std, marker="o", capsize=3)
-    ax.set(title="Nearest evaluation reward", ylabel="episode reward")
+    ax.set(title="Exact-frame evaluation reward", ylabel="episode reward")
 
     ax = axes[0, 1]
     ax.semilogy(
@@ -1247,8 +1254,525 @@ def diagnosis_text(
     return "\n".join(lines)
 
 
+CHEETAH_TASKS = (
+    "cheetah_walk", "cheetah_run", "cheetah_walk_backward", "cheetah_run_backward",
+)
+
+
+def finite_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: finite_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [finite_json(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
+
+
+def discover_flare_pairs(manifest: Path, output_dir: Path) -> List[Dict[str, Any]]:
+    """Use the approved run identities, but re-discover files on every invocation."""
+    source = json.loads(manifest.read_text())
+    pairs = []
+    evidence = []
+    for entry in source["pairs"]:
+        task = entry["task"]
+        if task not in CHEETAH_TASKS:
+            raise ValueError(f"Unsupported task: {task}")
+        pair: Dict[str, Any] = {"task": task}
+        for variant, original in (("flare", entry["flare"]), ("baseline", entry["baseline_original"])):
+            run_dir = Path(original["run_dir"])
+            config_path = run_dir / ".hydra/config.yaml"
+            cfg = omgcf.OmegaConf.load(config_path)
+            if (str(cfg.task) != task or str(cfg.obs_type) != "dino" or not cfg.use_cls
+                    or int(cfg.dino_frame_stack) != 3 or cfg.goal_space is not None
+                    or cfg.custom_reward is not None):
+                raise ValueError(f"Not an ordinary pixel-B CLS3 run: {config_path}")
+            if bool(getattr(cfg.agent, "dino_flare_b", False)) != (variant == "flare"):
+                raise ValueError(f"Variant flag mismatch: {config_path}")
+            checkpoint_dir = Path(cfg.checkpoint_root) / run_dir.name
+            checkpoints = {}
+            for path in checkpoint_dir.glob("snapshot_*.pt"):
+                match = re.fullmatch(r"snapshot_(\d+)\.pt", path.name)
+                if match and path.is_file():
+                    checkpoints[int(match.group(1))] = path
+            if not checkpoints:
+                raise FileNotFoundError(f"No numbered checkpoints: {checkpoint_dir}")
+            segments = [original] if variant == "flare" else entry["baseline_segments"]
+            eval_rows = []
+            eval_sources = []
+            for segment in segments:
+                path = Path(segment["run_dir"]) / "eval.csv"
+                if path.is_file():
+                    rows = read_evaluations(path)
+                    eval_rows.extend(rows)
+                    eval_sources.append({"path": str(path), "sha256": sha256_file(path), "rows": rows})
+            pair[variant] = {
+                "cfg": cfg, "run_dir": run_dir, "checkpoints": checkpoints,
+                "config_sha256": sha256_file(config_path), "eval_rows": eval_rows,
+            }
+            evidence.append({
+                "variant": variant, "task": task, "run_dir": str(run_dir),
+                "config_path": str(config_path), "config_sha256": sha256_file(config_path),
+                "config_yaml": config_path.read_text(), "eval_sources": eval_sources,
+                "checkpoint_every_frames": int(cfg.checkpoint_every),
+                "eval_every_frames": int(cfg.eval_every_frames),
+                "snapshot_at": list(cfg.snapshot_at),
+                "numbered_checkpoints": {str(frame): str(path) for frame, path in sorted(checkpoints.items())},
+            })
+        pair["frames"] = sorted(set(pair["flare"]["checkpoints"]) & set(pair["baseline"]["checkpoints"]))
+        pairs.append(pair)
+    if {pair["task"] for pair in pairs} != set(CHEETAH_TASKS):
+        raise ValueError("Manifest must contain each of the four Cheetah tasks exactly once")
+    if len(pairs) != len(CHEETAH_TASKS):
+        raise ValueError("Duplicate task in manifest")
+    atomic_json(output_dir / "discovery.json", finite_json({
+        "created_at_utc": datetime.now(timezone.utc).isoformat(), "runs": evidence,
+        "intersections": {pair["task"]: pair["frames"] for pair in pairs},
+    }))
+    return pairs
+
+
+def select_noise_checkpoints(pair: Mapping[str, Any]) -> Dict[str, Any]:
+    frames = sorted(pair["flare"]["checkpoints"])
+    if len(frames) < 3:
+        raise ValueError(f"Need three existing checkpoints for {pair['task']}: {frames}")
+    evaluations = sorted(pair["flare"]["eval_rows"], key=lambda row: row["frame"])
+    exact = {frame: exact_evaluation(evaluations, frame) for frame in frames}
+    valid = [frame for frame in frames if np.isfinite(exact[frame]["reward"])]
+    if len(valid) < 3:
+        raise ValueError(f"Need three checkpoints with exact reward AND std: {pair['task']}")
+    local_peaks = [row for before, row, after in zip(evaluations, evaluations[1:], evaluations[2:])
+                   if row["reward"] > before["reward"] and row["reward"] > after["reward"]]
+    saved_peaks = [row for row in local_peaks if int(row["frame"]) in valid[:-1]]
+    if pair["task"].endswith("_backward"):
+        peak, adjacent = valid[0], valid[1]
+        selected = [valid[0], valid[1], valid[-1]]
+        roles = ["early_level", "adjacent_level", "latest_level"]
+    else:
+        peak = (int(max(saved_peaks, key=lambda row: row["reward"])["frame"])
+                if saved_peaks else max(valid[:-1], key=lambda frame: exact[frame]["reward"]))
+        adjacent = valid[valid.index(peak) + 1]
+        early = next(frame for frame in valid if frame not in (peak, adjacent))
+        selected = sorted([early, peak, adjacent])
+        roles = ["peak_probe" if frame == peak else "adjacent_checkpoint" if frame == adjacent
+                 else "early" if frame < peak else "additional_checkpoint"
+                 for frame in selected]
+    drops = [(a, b) for a, b in zip(evaluations, evaluations[1:]) if a["reward"] > b["reward"]]
+    largest = max(drops, key=lambda ab: ab[0]["reward"] - ab[1]["reward"]) if drops else None
+    return finite_json({
+        "task": pair["task"], "frames": selected, "roles": dict(zip(map(str, selected), roles)),
+        "peak_frame": peak, "adjacent_checkpoint_frame": adjacent,
+        "logged_peak_reward": exact[peak]["reward"], "logged_peak_std": exact[peak]["reward_std"],
+        "logged_adjacent_reward": exact[adjacent]["reward"], "logged_adjacent_std": exact[adjacent]["reward_std"],
+        "probe_interval_frames": adjacent - peak,
+        "peak_is_true_local_eval_peak": peak in {int(row["frame"]) for row in local_peaks},
+        "immediate_eval_after_peak": next((row for row in evaluations if row["frame"] > peak), None),
+        "probe_is_immediate_eval_pair": adjacent - peak == int(pair["flare"]["cfg"].eval_every_frames),
+        "largest_logged_drop": None if largest is None else {
+            "from": largest[0], "to": largest[1],
+            "magnitude": largest[0]["reward"] - largest[1]["reward"],
+            "both_weights_available": all(int(row["frame"]) in frames for row in largest),
+        },
+        "limitation": "Unsaved 10k eval peaks cannot be replaced by nearest saved weights; coarse probes only.",
+    })
+
+
+def load_or_build_reward_labels(batch: FixedBatch, exorl_dir: Path, path: Path) -> Tuple[np.ndarray, str]:
+    """Four fixed task labels on the SAME next-state physics rows; no DINO."""
+    label_sources = {str(p.relative_to(Path(__file__).parent)): sha256_file(p) for p in (
+        Path(__file__).with_name("goals.py"), Path(__file__).parent / "custom_dmc_tasks/cheetah.py",
+    )}
+    if path.exists():
+        with np.load(path, allow_pickle=False) as payload:
+            rewards = np.asarray(payload["rewards"])
+            metadata = json.loads(str(payload["metadata"].item()))
+        digest = hash_arrays((("rewards", rewards),))
+        if (metadata["sha256"] != digest or metadata["batch_sha256"] != batch.metadata["batch_sha256"]
+                or metadata.get("label_sources") != label_sources
+                or metadata["tasks"] != list(CHEETAH_TASKS)
+                or rewards.shape != (batch.obs.shape[0], len(CHEETAH_TASKS))
+                or not np.isfinite(rewards).all()):
+            raise ValueError("Fixed reward labels digest/contract mismatch")
+        return rewards, digest
+    from url_benchmark.goals import DmcReward
+
+    rewards = np.empty((batch.obs.shape[0], len(CHEETAH_TASKS)), dtype=np.float32)
+    files = episode_file_map(exorl_dir)
+    rewarders = [DmcReward(task) for task in CHEETAH_TASKS]
+    try:
+        for episode in np.unique(batch.episode_id):
+            rows = np.flatnonzero(batch.episode_id == episode)
+            with np.load(files[int(episode)][0], allow_pickle=False) as payload:
+                physics = payload["physics"][batch.step_in_episode[rows] + 1]
+            for destination, state in zip(rows, physics):
+                rewards[destination] = [rewarder.from_physics(state) for rewarder in rewarders]
+    finally:
+        for rewarder in rewarders:
+            rewarder._env.close()
+    if not np.isfinite(rewards).all():
+        raise FloatingPointError("Non-finite reward bank labels")
+    digest = hash_arrays((("rewards", rewards),))
+    atomic_npz(path, rewards=rewards, metadata=np.asarray(json.dumps({
+        "sha256": digest, "batch_sha256": batch.metadata["batch_sha256"], "tasks": list(CHEETAH_TASKS),
+        "label_sources": label_sources,
+        "definition": "DmcReward(task).from_physics(episode.physics[step_in_episode+1]); single next-state reward, not action-repeat sum",
+    })))
+    return rewards, digest
+
+
+def infer_fixed_reward_vectors(agent: Any, batch: FixedBatch, rewards: np.ndarray,
+                               device: str, chunk_size: int) -> np.ndarray:
+    """One deterministic fixed-bank reward vector per task and checkpoint."""
+    parts = []
+    with torch.inference_mode():
+        for start in range(0, len(batch.next_obs), chunk_size):
+            obs = torch.as_tensor(batch.next_obs[start:start + chunk_size], device=device)
+            backward = agent.backward_net(agent.backward_aug_and_encode(obs))
+            parts.append(backward.cpu())
+        backward = torch.cat(parts)
+        reward_t = torch.as_tensor(rewards, dtype=backward.dtype)
+        vectors = reward_t.T @ backward / len(backward)
+        norms = torch.linalg.vector_norm(vectors, dim=1, keepdim=True)
+        if not torch.isfinite(vectors).all() or torch.any(norms <= 1e-12):
+            raise ValueError("Zero/non-finite reward vector: direction is undefined")
+        if bool(agent.cfg.norm_z):
+            vectors = math.sqrt(int(agent.cfg.z_dim)) * vectors / norms
+        return vectors.numpy().astype(np.float32)
+
+
+def load_frozen_rollout_dino(model_name: str, device: str,
+                             cuda_runtime_discovery: bool = False) -> Tuple[Any, Any, Dict[str, Any]]:
+    """Load the frontend once, only for fresh visual rollouts, from local cache."""
+    import importlib.metadata
+    from transformers import AutoImageProcessor, AutoModel
+
+    if cuda_runtime_discovery:
+        # PyTorch 2.4's NVML discovery can wait on other physical GPUs. Use the
+        # actual CUDART visible count for this process only; no driver changes.
+        if not device.startswith("cuda") or not hasattr(torch.cuda, "_cached_device_count"):
+            raise ValueError("Runtime discovery requires the supported CUDA/PyTorch runtime")
+        count = torch._C._cuda_getDeviceCount()
+        if count < 1:
+            raise RuntimeError("CUDA runtime sees no available devices")
+        torch.cuda._cached_device_count = count
+        print(f"CUDA discovery: CUDART reports {count} visible device(s); NVML skipped", flush=True)
+    processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True, local_files_only=True)
+    model = AutoModel.from_pretrained(model_name, local_files_only=True).eval().to(device)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    provenance = {
+        "model_name": model_name, "revision": getattr(model.config, "_commit_hash", None),
+        "processor_class": type(processor).__name__, "processor_config": processor.to_dict(),
+        "versions": {package: importlib.metadata.version(package)
+                     for package in ("torch", "transformers", "dm-control", "mujoco", "numpy")},
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "mujoco_gl": os.environ.get("MUJOCO_GL"),
+        "mujoco_egl_device_id": os.environ.get("MUJOCO_EGL_DEVICE_ID"), "device": device,
+        "local_files_only": True,
+        "cuda_device_discovery": "CUDART visible-count cache" if cuda_runtime_discovery else "PyTorch default",
+    }
+    return model, processor, provenance
+
+
+def seeded_fixed_z_rollout(agent: Any, cfg: Any, seed: int, z: np.ndarray, frame: int,
+                           device: str, model: Any, processor: Any) -> Dict[str, Any]:
+    from url_benchmark import dmc
+
+    # The existing dmc.make DINO wrapper defaults to cuda; use isolated GPU visibility.
+    if device not in ("cuda", "cuda:0"):
+        raise ValueError("DINO rollouts require logical cuda:0 with CUDA_VISIBLE_DEVICES set")
+    fixed_z = np.asarray(z, dtype=np.float32).copy()
+    if fixed_z.shape != (int(agent.cfg.z_dim),) or not np.isfinite(fixed_z).all():
+        raise ValueError("Invalid fixed task vector")
+    z_sha = hashlib.sha256(fixed_z.tobytes()).hexdigest()
+    meta = {"z": fixed_z}
+    env = None
+    try:
+        env = dmc.make(
+            str(cfg.task), obs_type="dino", frame_stack=int(cfg.frame_stack),
+            action_repeat=int(cfg.action_repeat), seed=int(seed), goal_space=None,
+            append_goal_to_observation=False, use_cls=True, dino_model=model,
+            dino_processor=processor, render_shape=tuple(cfg.render_shape),
+            dino_frame_stack=int(cfg.dino_frame_stack),
+        )
+        reward, steps = 0.0, 0
+        with torch.inference_mode():
+            time_step = env.reset()
+            while not time_step.last():
+                action = agent.act(time_step.observation, meta, frame // int(cfg.action_repeat), eval_mode=True)
+                time_step = env.step(action)
+                reward += float(time_step.reward)
+                steps += 1
+        if hashlib.sha256(meta["z"].tobytes()).hexdigest() != z_sha or not np.isfinite(reward):
+            raise ValueError("Fixed z changed or rollout reward is non-finite")
+        return {"task": str(cfg.task), "checkpoint_frame": frame, "environment_seed": seed,
+                "episode_reward": reward, "episode_steps": steps,
+                "episode_frames": steps * int(cfg.action_repeat), "z_sha256": z_sha}
+    finally:
+        if env is not None:
+            env.close()
+
+
+def flare_provenance(args: argparse.Namespace, pairs: Sequence[Mapping[str, Any]],
+                     batch: FixedBatch, labels_sha: str, dino: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "git_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "command_line": [sys.executable, *sys.argv], "analyzer_sha256": sha256_file(Path(__file__)),
+        "config_hashes": {pair["task"]: {v: pair[v]["config_sha256"] for v in ("flare", "baseline")} for pair in pairs},
+        "fixed_batch_sha256": batch.metadata["batch_sha256"], "fixed_reward_labels_sha256": labels_sha,
+        "environment_seeds": list(args.eval_seeds), "reward_bank_size": len(batch.obs),
+        "dinov2": dict(dino), "inferred_z_bootstrap": False,
+        "lr_matched": False, "phase0_manifest_sha256": sha256_file(args.pair_manifest),
+    }
+
+
+def evaluation_code_identity() -> Dict[str, Any]:
+    return {
+        "evaluator_sha256": hashlib.sha256("\n".join(inspect.getsource(func) for func in (
+            prepare_agent, load_checkpoint_agent, infer_fixed_reward_vectors,
+            seeded_fixed_z_rollout, load_frozen_rollout_dino,
+        )).encode()).hexdigest(),
+        "source_sha256": {name: sha256_file(Path(__file__).parent / name) for name in (
+            "agent/fb_ddpg.py", "dmc.py", "goals.py", "utils.py", "custom_dmc_tasks/cheetah.py",
+        )},
+    }
+
+
+def evaluate_fixed_checkpoint(args: argparse.Namespace, pair: Mapping[str, Any], variant: str,
+                              frame: int, batch: FixedBatch, labels: np.ndarray, labels_sha: str,
+                              model: Any, processor: Any, dino: Mapping[str, Any]) -> Dict[str, Any]:
+    run = pair[variant]
+    path = run["checkpoints"][frame]
+    output = args.output_dir / "evaluations" / pair["task"] / variant / str(frame)
+    output.mkdir(parents=True, exist_ok=True)
+    contract = {
+        "checkpoint_path": str(path), "checkpoint_sha256": sha256_file(path),
+        "config_sha256": run["config_sha256"], "batch_sha256": batch.metadata["batch_sha256"],
+        "labels_sha256": labels_sha, "dinov2": dict(dino), "schema_version": 1,
+        **evaluation_code_identity(),
+        "inference": "float32 mean(reward*B), normalize to sqrt(z_dim), fixed bank; no bootstrap",
+    }
+    contract_path = output / "contract.json"
+    if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
+        raise ValueError(f"Evaluation provenance mismatch: {output}")
+    agent = None
+    z_path = output / "fixed_z.npz"
+    try:
+        if z_path.exists():
+            if not contract_path.exists():
+                raise ValueError(f"Missing provenance for fixed z: {output}")
+            with np.load(z_path, allow_pickle=False) as saved:
+                vectors = np.asarray(saved["vectors"])
+                expected = str(saved["sha256"].item())
+            if hash_arrays((("vectors", vectors),)) != expected:
+                raise ValueError(f"Fixed z SHA mismatch: {z_path}")
+        else:
+            atomic_json(contract_path, contract)
+            agent, info = load_checkpoint_agent(path, args.device)
+            if info["global_step"] * int(run["cfg"].action_repeat) != frame:
+                raise ValueError(f"Checkpoint frame mismatch: {path}")
+            vectors = infer_fixed_reward_vectors(agent, batch, labels, args.device, args.inference_batch_size)
+            atomic_npz(z_path, vectors=vectors, sha256=np.asarray(hash_arrays((("vectors", vectors),))))
+        z = vectors[CHEETAH_TASKS.index(pair["task"])]
+        z_sha = hashlib.sha256(z.tobytes()).hexdigest()
+        seeds = []
+        for seed in args.eval_seeds:
+            seed_path = output / f"seed_{seed}.json"
+            if seed_path.exists():
+                result = json.loads(seed_path.read_text())
+                if (result["z_sha256"] != z_sha or result["environment_seed"] != seed
+                        or result["checkpoint_frame"] != frame or result["task"] != pair["task"]):
+                    raise ValueError(f"Saved seed result mismatch: {seed_path}")
+            else:
+                if agent is None:
+                    agent, info = load_checkpoint_agent(path, args.device)
+                    if info["global_step"] * int(run["cfg"].action_repeat) != frame:
+                        raise ValueError(f"Checkpoint frame mismatch: {path}")
+                result = seeded_fixed_z_rollout(agent, run["cfg"], seed, z, frame,
+                                                args.device, model, processor)
+                atomic_json(seed_path, result)
+            seeds.append(result)
+            print(f"eval {variant} {pair['task']} {frame} seed={seed}: {result['episode_reward']:.6g}", flush=True)
+        returns = [row["episode_reward"] for row in seeds]
+        summary = {
+            "variant": variant, "task": pair["task"], "checkpoint_frame": frame,
+            "reward_mean": float(np.mean(returns)), "reward_std": float(np.std(returns, ddof=1)),
+            "reward_std_definition": "sample std across independently seeded episodes, ddof=1; not SEM",
+            "environment_seeds": list(args.eval_seeds), "z_sha256": z_sha, "checkpoint_sha256": contract["checkpoint_sha256"],
+            "seed_results": seeds,
+        }
+        atomic_json(output / "summary.json", summary)
+        return summary
+    finally:
+        del agent
+        gc.collect()
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+
+def run_flare_noise(args: argparse.Namespace) -> None:
+    if len(set(args.eval_seeds)) != len(args.eval_seeds) or len(args.eval_seeds) < 5:
+        raise ValueError("At least five distinct environment seeds are required")
+    args.output_dir = args.output_dir.resolve()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    metadata_dir = args.output_dir / "workers" / args.noise_task if args.noise_task else args.output_dir
+    pairs = discover_flare_pairs(args.pair_manifest, metadata_dir)
+    selections = {pair["task"]: select_noise_checkpoints(pair) for pair in pairs}
+    atomic_json(metadata_dir / "phase1_selection.json", selections)
+    bank_args = argparse.Namespace(**vars(args))
+    bank_args.output_dir = args.output_dir / "reward_bank"
+    bank_args.batch_size = args.reward_bank_size
+    batch = load_or_build_fixed_batch(bank_args, expected_z_dim=50)
+    # Initialize CUDA before constructing/closing DMC physics for new labels.
+    model, processor, dino = load_frozen_rollout_dino(
+        str(pairs[0]["flare"]["cfg"].dino_model_name), args.device, args.cuda_runtime_discovery)
+    labels, labels_sha = load_or_build_reward_labels(batch, args.exorl_dir, bank_args.output_dir / "reward_labels.npz")
+    provenance = flare_provenance(args, pairs, batch, labels_sha, dino)
+    atomic_json(metadata_dir / "phase1_provenance.json", provenance)
+    rows = []
+    for pair in pairs:
+        if args.noise_task and pair["task"] != args.noise_task:
+            continue
+        for frame in selections[pair["task"]]["frames"]:
+            rows.append(evaluate_fixed_checkpoint(args, pair, "flare", frame, batch, labels, labels_sha,
+                                                  model, processor, dino))
+            atomic_json(metadata_dir / "phase1_progress.json", {"completed": rows, "provenance": provenance})
+    if args.noise_task:
+        print(f"Phase 1 worker complete: {args.noise_task}; global noise gate awaits all four tasks", flush=True)
+        return
+    write_noise_summary(args, pairs, selections, rows, provenance)
+
+
+def summarize_saved_noise(args: argparse.Namespace) -> None:
+    """Validate all four completed workers and report without loading DINO/GPU."""
+    args.output_dir = args.output_dir.resolve()
+    rows, selections, workers = [], {}, {}
+    common: Dict[str, Any] = {}
+    identity = evaluation_code_identity()
+    batch = load_fixed_batch(args.output_dir / "reward_bank/fixed_replay_batch.npz")
+    if not (args.output_dir / "reward_bank/reward_labels.npz").is_file():
+        raise FileNotFoundError("Cannot summarize without the original persisted reward labels")
+    _, labels_sha = load_or_build_reward_labels(
+        batch, args.exorl_dir, args.output_dir / "reward_bank/reward_labels.npz")
+    for task in CHEETAH_TASKS:
+        worker = args.output_dir / "workers" / task
+        progress = json.loads((worker / "phase1_progress.json").read_text())
+        provenance = progress["provenance"]
+        workers[task] = provenance
+        conditions = {key: provenance[key] for key in (
+            "git_sha", "analyzer_sha256", "config_hashes", "fixed_batch_sha256",
+            "fixed_reward_labels_sha256", "environment_seeds", "dinov2", "reward_bank_size",
+        )}
+        if common and conditions != common:
+            raise ValueError(f"Worker measurement conditions differ: {task}")
+        common = conditions
+        if (common["fixed_batch_sha256"] != batch.metadata["batch_sha256"]
+                or common["fixed_reward_labels_sha256"] != labels_sha
+                or common["environment_seeds"] != list(args.eval_seeds)):
+            raise ValueError("Worker fixed-bank/seed provenance mismatch")
+        selections[task] = json.loads((worker / "phase1_selection.json").read_text())[task]
+        completed = progress["completed"]
+        if sorted(row["checkpoint_frame"] for row in completed) != sorted(selections[task]["frames"]):
+            raise ValueError(f"Worker incomplete: {task}")
+        for row in completed:
+            frame = row["checkpoint_frame"]
+            directory = args.output_dir / "evaluations" / task / "flare" / str(frame)
+            contract = json.loads((directory / "contract.json").read_text())
+            if (any(contract[key] != value for key, value in identity.items())
+                    or contract["checkpoint_sha256"] != sha256_file(Path(contract["checkpoint_path"]))
+                    or contract["batch_sha256"] != common["fixed_batch_sha256"]
+                    or contract["labels_sha256"] != labels_sha
+                    or contract["dinov2"] != common["dinov2"]):
+                raise ValueError(f"Saved checkpoint evaluation contract changed: {directory}")
+            with np.load(directory / "fixed_z.npz", allow_pickle=False) as saved:
+                vectors = saved["vectors"]
+                if hash_arrays((("vectors", vectors),)) != str(saved["sha256"].item()):
+                    raise ValueError(f"Fixed z digest mismatch: {directory}")
+            z_sha = hashlib.sha256(vectors[CHEETAH_TASKS.index(task)].tobytes()).hexdigest()
+            seed_rows = [json.loads((directory / f"seed_{seed}.json").read_text()) for seed in args.eval_seeds]
+            if (seed_rows != row["seed_results"] or row["task"] != task or row["z_sha256"] != z_sha
+                    or any(r["z_sha256"] != z_sha or r["environment_seed"] != seed
+                           or r["checkpoint_frame"] != frame or r["task"] != task
+                           for seed, r in zip(args.eval_seeds, seed_rows))):
+                raise ValueError(f"Seed results changed: {directory}")
+            returns = [r["episode_reward"] for r in seed_rows]
+            if (not np.isfinite(returns).all() or len(set(args.eval_seeds)) < 5
+                    or not np.isclose(row["reward_mean"], np.mean(returns), rtol=0, atol=1e-12)
+                    or not np.isclose(row["reward_std"], np.std(returns, ddof=1), rtol=0, atol=1e-12)):
+                raise ValueError(f"Invalid reward statistics: {directory}")
+            rows.append(row)
+    provenance = {**common, "worker_provenance": workers,
+                  "aggregation_command_line": [sys.executable, *sys.argv],
+                  "aggregation_analyzer_sha256": sha256_file(Path(__file__)),
+                  "lr_matched": False, "inferred_z_bootstrap": False}
+    atomic_json(args.output_dir / "phase1_selection.json", selections)
+    write_noise_summary(args, [{"task": task} for task in CHEETAH_TASKS], selections, rows, provenance)
+
+
+def write_noise_summary(args: argparse.Namespace, pairs: Sequence[Mapping[str, Any]],
+                        selections: Mapping[str, Any], rows: Sequence[Mapping[str, Any]],
+                        provenance: Mapping[str, Any]) -> None:
+    decisions = []
+    for pair in pairs:
+        task = pair["task"]
+        selected = selections[task]
+        task_rows = {row["checkpoint_frame"]: row for row in rows if row["task"] == task}
+        peak, adjacent = (task_rows[selected[key]] for key in ("peak_frame", "adjacent_checkpoint_frame"))
+        drop = peak["reward_mean"] - adjacent["reward_mean"]
+        noise = max(peak["reward_std"], adjacent["reward_std"])
+        decisions.append({
+            "task": task, "task_group": "direction_recovery" if task.endswith("_backward") else "spike_diagnosis",
+            "peak_frame": peak["checkpoint_frame"], "adjacent_frame": adjacent["checkpoint_frame"],
+            "fixed_bank_reward_drop": drop, "max_endpoint_seed_std": noise,
+            "drop_exceeds_seed_std": bool(drop > noise), "drop_exceeds_two_seed_std": bool(drop > 2 * noise),
+            "fine_spike_resolvable": selected["probe_is_immediate_eval_pair"],
+            "logged_drop": selected["logged_peak_reward"] - selected["logged_adjacent_reward"],
+            "limitation": selected["limitation"],
+        })
+    proceed = any(row["drop_exceeds_seed_std"] for row in decisions if row["task_group"] == "spike_diagnosis")
+    summary = {"proceed_to_geometry": proceed, "decisions": decisions, "checkpoints": rows, "provenance": provenance,
+               "note": "Gate concerns measured coarse checkpoint drops only. Unsaved fine spikes remain unresolved; inferred-z sampling noise has not been tested."}
+    atomic_json(args.output_dir / "phase1_summary.json", summary)
+    atomic_csv(args.output_dir / "checkpoint_diagnostics.csv", [
+        {key: row[key] for key in ("variant", "task", "checkpoint_frame", "reward_mean", "reward_std", "z_sha256")}
+        for row in rows
+    ])
+    text = ["# Phase 1: fixed-bank z, independent environment seeds", "",
+            "| Task | Frame | Mean | Seed std (ddof=1) |", "|---|---:|---:|---:|"]
+    text += [f"| {r['task']} | {r['checkpoint_frame']} | {r['reward_mean']:.6g} | {r['reward_std']:.6g} |" for r in rows]
+    text += ["", "Fixed z is reused across every seed at a checkpoint. No inferred-z bootstrap.", ""]
+    for row in decisions:
+        if row["task_group"] == "direction_recovery":
+            levels = sorted((item for item in rows if item["task"] == row["task"]), key=lambda item: item["checkpoint_frame"])
+            first, last = levels[0], levels[-1]
+            text.append(f"- {row['task']} (direction recovery): early {first['reward_mean']:.6g} ± {first['reward_std']:.6g}, "
+                        f"latest {last['reward_mean']:.6g} ± {last['reward_std']:.6g}. Assess absolute reward/off-zero performance; "
+                        "this is not a spike classification and baseline is not re-evaluated in Phase 1.")
+            continue
+        text.append(f"- {row['task']}: fixed-bank drop {row['fixed_bank_reward_drop']:.6g}, "
+                    f"max endpoint seed std {row['max_endpoint_seed_std']:.6g}; exceeds one std: "
+                    f"{row['drop_exceeds_seed_std']}. Fine spike resolvable: {row['fine_spike_resolvable']}.")
+    text += ["", f"Proceed to coarse geometry: {proceed}.", summary["note"], "",
+             f"Rollout renderer: {provenance['dinov2']['mujoco_gl']}. Pixel equivalence to training EGL is unverified."]
+    (args.output_dir / "PHASE1_REPORT.md").write_text("\n".join(text) + "\n")
+    print(f"Phase 1 complete; proceed_to_geometry={proceed}", flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("legacy", "flare-noise"), default="legacy")
+    parser.add_argument("--pair-manifest", type=Path, default=Path(
+        "analysis_outputs/cheetah_flare_b_phase0_20260905/run_discovery.json"))
+    parser.add_argument("--eval-seeds", type=parse_ints, default=(101, 202, 303, 404, 505))
+    parser.add_argument("--reward-bank-size", type=int, default=20480)
+    parser.add_argument("--noise-task", choices=CHEETAH_TASKS,
+                        help="Evaluate one task in an isolated worker; never decide the global geometry gate")
+    parser.add_argument("--summarize-noise-only", action="store_true",
+                        help="Verify and summarize all saved workers without model loading or rollouts")
+    parser.add_argument("--cuda-runtime-discovery", action="store_true",
+                        help="Use CUDART discovery when host NVML initialization stalls (PyTorch 2.4)")
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument(
@@ -1271,7 +1795,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated fixed top-eigenspace ranks for principal angles",
     )
     parser.add_argument(
-        "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
+        "--device", default=None
     )
     return parser
 
@@ -1304,6 +1828,14 @@ def validate_inputs(args: argparse.Namespace) -> Tuple[List[Path], omgcf.DictCon
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.device is None:
+        args.device = "cpu" if args.summarize_noise_only else "cuda:0" if torch.cuda.is_available() else "cpu"
+    if args.mode == "flare-noise":
+        if args.summarize_noise_only:
+            summarize_saved_noise(args)
+        else:
+            run_flare_noise(args)
+        return
     args.run_dir = args.run_dir.resolve()
     args.checkpoint_dir = args.checkpoint_dir.resolve()
     args.exorl_dir = args.exorl_dir.resolve()

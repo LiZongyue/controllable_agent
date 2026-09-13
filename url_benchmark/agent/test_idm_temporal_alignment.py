@@ -71,9 +71,11 @@ def _stack(*indices: int) -> np.ndarray:
     )
 
 
-def _make_agent(batch_size: int) -> fb_ddpg.FBDDPGAgent:
+def _make_agent(
+    batch_size: int, obs_shape: tp.Tuple[int, ...] = (6,)
+) -> fb_ddpg.FBDDPGAgent:
     return fb_ddpg.FBDDPGAgent(
-        obs_shape=(6,),
+        obs_shape=obs_shape,
         action_shape=(2,),
         obs_type="dino",
         device="cpu",
@@ -93,6 +95,72 @@ def _make_agent(batch_size: int) -> fb_ddpg.FBDDPGAgent:
         mix_ratio=0.0,
         future_ratio=0.0,
         idm_coef=0.1,
+    )
+
+
+def test_idm_single_frame_temporal_alignment_end_to_end() -> None:
+    """A one-frame CLS transition must reach IDM as (obs_t, obs_t+1, a_t)."""
+    env = dmc.ExtendedTimeStepWrapper(
+        dmc.EmbedStackWrapper(_DeterministicEmbeddingEnv(), 1)
+    )
+    replay = ReplayBuffer(max_episodes=1, discount=0.99, future=0.0)
+    actions = np.array(
+        [[0.1, -0.1], [0.2, -0.2], [0.3, -0.3], [0.4, -0.4]],
+        dtype=np.float32,
+    )
+
+    time_step = env.reset()
+    replay.add(time_step, meta={})
+    for action in actions:
+        time_step = env.step(action)
+        replay.add(time_step, meta={})
+
+    # Replay adds one to this raw offset, selecting the transition 1 -> 2.
+    with mock.patch(
+        "url_benchmark.in_memory_replay_buffer.np.random.randint",
+        side_effect=[np.zeros(1, dtype=np.int64), np.ones(1, dtype=np.int64)],
+    ):
+        batch = replay.sample(1)
+
+    expected_obs = _stack(1)[None]
+    expected_next_obs = _stack(2)[None]
+    expected_action = actions[[1]]
+    np.testing.assert_array_equal(batch.obs, expected_obs)
+    np.testing.assert_array_equal(batch.next_obs, expected_next_obs)
+    np.testing.assert_array_equal(batch.action, expected_action)
+
+    torch.manual_seed(2026)
+    agent = _make_agent(batch_size=1, obs_shape=(2,))
+    assert agent.idm_head is not None
+    with torch.no_grad():
+        encoded_obs = agent.encoder(torch.from_numpy(expected_obs)).clone()
+        encoded_next_obs = agent.encoder(torch.from_numpy(expected_next_obs)).clone()
+    fixed_replay = mock.Mock()
+    fixed_replay.sample.return_value = batch
+    with mock.patch.object(
+        agent, "_compute_idm_loss", wraps=agent._compute_idm_loss
+    ) as compute_idm_loss, mock.patch.object(
+        agent.idm_head, "forward", wraps=agent.idm_head.forward
+    ) as idm_forward:
+        agent.update(fixed_replay, step=0)
+
+    fixed_replay.sample.assert_called_once_with(1)
+    compute_idm_loss.assert_called_once()
+    idm_forward.assert_called_once()
+    idm_obs, idm_next_obs, idm_action = compute_idm_loss.call_args.args[:3]
+    torch.testing.assert_close(
+        idm_obs, encoded_obs, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        idm_next_obs, encoded_next_obs, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        idm_action, torch.from_numpy(expected_action), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        idm_forward.call_args.args[0],
+        torch.cat([encoded_obs, encoded_next_obs], dim=-1),
+        rtol=0, atol=0,
     )
 
 

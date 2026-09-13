@@ -211,7 +211,7 @@ def walker_dummy() -> np.ndarray:
 
 
 def _make_env(domain: str) -> dmc.EnvWrapper:
-    task = {"quadruped": "stand", "walker": "walk", "jaco": "reach_top_left", "point_mass_maze": "reach_bottom_right"}[domain]
+    task = {"quadruped": "stand", "walker": "walk", "cheetah": "walk", "jaco": "reach_top_left", "point_mass_maze": "reach_bottom_right"}[domain]
     return dmc.make(f"{domain}_{task}", obs_type="states", frame_stack=1, action_repeat=1, seed=12)
 
 
@@ -264,14 +264,21 @@ class DmcReward(BaseReward):
     def __init__(self, name: str) -> None:
         super().__init__()
         self.name = name
-        env_name, task_name = name.split("_", maxsplit=1)
+        if name.startswith("point_mass_maze_"):
+            env_name = "point_mass_maze"
+            task_name = name[len("point_mass_maze_"):]
+        else:
+            env_name, task_name = name.split("_", maxsplit=1)
         try:
             from dm_control import suite  # import
             from url_benchmark import custom_dmc_tasks as cdmc
         except ImportError as e:
             raise dmc.UnsupportedPlatform("DMC does not run on Mac") from e
-        make = suite.load if (env_name, task_name) in suite.ALL_TASKS else cdmc.make
-        self._env = make(env_name, task_name)
+        if env_name == "jaco":
+            self._env = cdmc.make_jaco(task_name, obs_type="states", seed=12)
+        else:
+            make = suite.load if (env_name, task_name) in suite.ALL_TASKS else cdmc.make
+            self._env = make(env_name, task_name)
 
     def from_env(self, env: dmc.EnvWrapper) -> float:
         return float(self._env.task.get_reward(env.physics))
@@ -665,26 +672,26 @@ class WalkerRandomReward(WalkerEquation):
 # def quadruped_jump() -> np.ndarray:
 #     return np.array([1.0, 0.0, 1.0], dtype=np.float32)
 
-# @goal_spaces("cheetah")
-# def cheetah_speed(env: dmc.EnvWrapper) -> np.ndarray:
-#     return np.array([
-#         env.physics.speed(),
-#         env.physics.angmomentum(),
-#     ], dtype=np.float32)
+@goal_spaces("cheetah")
+def cheetah_speed(env: dmc.EnvWrapper) -> np.ndarray:
+    return np.array([
+        env.physics.speed(),
+        env.physics.named.data.subtree_angmom['torso', 'y'],
+    ], dtype=np.float32)
 
 
-# @goals("cheetah_speed")
-# def cheetah_walk() -> np.ndarray:
-#     return np.array([2.0, 0.0], dtype=np.float32)
+@goals("cheetah_speed")
+def cheetah_walk() -> np.ndarray:
+    return np.array([2.0, 0.0], dtype=np.float32)
 
-# @goals("cheetah_speed")
-# def cheetah_run() -> np.ndarray:
-#     return np.array([10.0, 0.0], dtype=np.float32)
+@goals("cheetah_speed")
+def cheetah_run() -> np.ndarray:
+    return np.array([10.0, 0.0], dtype=np.float32)
 
-# @goals("cheetah_speed")
-# def cheetah_walk_backward() -> np.ndarray:
-#     return np.array([-2.0, 0.0], dtype=np.float32)
+@goals("cheetah_speed")
+def cheetah_walk_backward() -> np.ndarray:
+    return np.array([-2.0, 0.0], dtype=np.float32)
 
-# @goals("cheetah_speed")
-# def cheetah_run_backward() -> np.ndarray:
-#     return np.array([-10.0, 0.0], dtype=np.float32)
+@goals("cheetah_speed")
+def cheetah_run_backward() -> np.ndarray:
+    return np.array([-10.0, 0.0], dtype=np.float32)

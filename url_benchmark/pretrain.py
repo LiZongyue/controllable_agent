@@ -5,6 +5,7 @@
 
 import os
 import json
+import math
 import pdb  # pylint: disable=unused-import
 import logging
 import dataclasses
@@ -128,19 +129,63 @@ ConfigStore.instance().store(name="workspace_config", node=PretrainConfig)
 
 
 def _validate_idm_training_config(cfg: tp.Any) -> None:
-    """Keep the IDM auxiliary on the three-frame DINO CLS FB variant."""
+    """Keep the IDM auxiliary on DINO CLS FB variants.
+
+    IDM consumes the replay transition ``(obs_t, action_t, obs_t+1)``.  It is
+    therefore valid for both a single frozen CLS embedding and a temporal
+    stack of CLS embeddings; the replay transition provides the temporal pair
+    in either case.
+    """
     idm_coef = float(getattr(cfg.agent, "idm_coef", 0.0))
     idm_lr = getattr(cfg.agent, "idm_lr", None)
     idm_encoder_mode = str(getattr(cfg.agent, "idm_encoder_mode", "legacy"))
+    idm_route = str(getattr(cfg.agent, "idm_route", "none"))
     if idm_coef < 0:
         raise ValueError("agent.idm_coef must be non-negative")
-    if idm_lr is not None and float(idm_lr) <= 0:
-        raise ValueError("agent.idm_lr must be positive when provided")
+    if idm_lr is not None and (
+        not math.isfinite(float(idm_lr)) or float(idm_lr) <= 0
+    ):
+        raise ValueError("agent.idm_lr must be positive and finite when provided")
+    if idm_route not in {"none", "forward_adapter", "backward_adapter"}:
+        raise ValueError(
+            "agent.idm_route must be one of none, forward_adapter, or "
+            "backward_adapter"
+        )
     if idm_coef > 0 and not bool(getattr(cfg, "update_encoder", False)):
         raise ValueError("agent.idm_coef > 0 requires update_encoder=True")
+    separate_fb_adapters = bool(
+        getattr(cfg.agent, "dino_separate_fb_adapters", False)
+    )
+    if idm_route != "none":
+        if idm_coef <= 0:
+            raise ValueError("an explicit agent.idm_route requires agent.idm_coef > 0")
+        if not separate_fb_adapters:
+            raise ValueError(
+                "explicit agent.idm_route requires "
+                "agent.dino_separate_fb_adapters=True"
+            )
+        if (
+            cfg.obs_type != "dino"
+            or not bool(getattr(cfg, "use_cls", False))
+            or not bool(getattr(cfg.agent, "dino_use_adapter", True))
+            or getattr(cfg, "goal_space", None) is not None
+        ):
+            raise ValueError(
+                "explicit agent.idm_route requires DINO CLS, a trainable adapter, "
+                "and goal_space=null"
+            )
+        if idm_encoder_mode != "static":
+            raise ValueError(
+                "explicit agent.idm_route requires agent.idm_encoder_mode=static"
+            )
+    elif separate_fb_adapters and idm_coef > 0:
+        raise ValueError(
+            "IDM with separate F/B adapters requires an explicit agent.idm_route"
+        )
     idm_configured = (
         idm_coef != 0
         or idm_lr is not None
+        or idm_route != "none"
         or idm_encoder_mode != "legacy"
         or int(getattr(cfg.agent, "idm_encoder_burnin_steps", 0)) != 0
         or int(getattr(cfg.agent, "idm_encoder_ramp_steps", 0)) != 0
@@ -150,10 +195,9 @@ def _validate_idm_training_config(cfg: tp.Any) -> None:
         getattr(cfg.agent, "name", None) != "fb_ddpg"
         or cfg.obs_type != "dino"
         or not cfg.use_cls
-        or cfg.dino_frame_stack != 3
     ):
         raise ValueError(
-            "IDM auxiliary training is supported only for FB with three-frame DINO CLS observations"
+            "IDM auxiliary training is supported only for FB with DINO CLS observations"
         )
 
 
@@ -672,6 +716,18 @@ class BaseWorkspace(tp.Generic[C]):
                     "cheetah": ['walk', 'walk_backward', 'run', 'run_backward'],
                     "quadruped": ['stand', 'walk', 'run', 'jump'],
                     "walker": ['stand', 'walk', 'run', 'flip'],
+                    "jaco": [
+                        'reach_top_left',
+                        'reach_top_right',
+                        'reach_bottom_left',
+                        'reach_bottom_right',
+                    ],
+                    "point_mass_maze": [
+                        'reach_top_left',
+                        'reach_top_right',
+                        'reach_bottom_left',
+                        'reach_bottom_right',
+                    ],
                 }
                 if self.domain not in domain_tasks:
                     return
@@ -699,7 +755,9 @@ class BaseWorkspace(tp.Generic[C]):
 
         with (self.work_dir / "test_rewards.json").open("w") as f:
             json.dump(rewards, f)
-        if self.cfg.use_wandb and self.domain in {"walker", "quadruped", "cheetah"}:
+        if self.cfg.use_wandb and self.domain in {
+            "walker", "quadruped", "cheetah", "jaco", "point_mass_maze"
+        }:
             final_metrics = {
                 f"final/{task}": float(np.mean(task_rewards))
                 for task, task_rewards in rewards.items()

@@ -47,15 +47,15 @@ def _idm_config(**overrides: tp.Any) -> SimpleNamespace:
 
 def test_validate_idm_training_config() -> None:
     _validate_idm_training_config(_idm_config())
+    _validate_idm_training_config(_idm_config(dino_frame_stack=1))
 
     invalid_configs = [
         _idm_config(obs_type="pixels"),
         _idm_config(use_cls=False),
-        _idm_config(dino_frame_stack=1),
         _idm_config(agent=SimpleNamespace(name="other", idm_coef=0.1, idm_lr=None)),
     ]
     for cfg in invalid_configs:
-        with pytest.raises(ValueError, match="three-frame DINO CLS"):
+        with pytest.raises(ValueError, match="FB with DINO CLS"):
             _validate_idm_training_config(cfg)
 
     with pytest.raises(ValueError, match="requires update_encoder=True"):
@@ -70,6 +70,44 @@ def test_validate_idm_training_config() -> None:
             agent=SimpleNamespace(name="fb_ddpg", idm_coef=0.0, idm_lr=None),
         )
     )
+
+
+def test_validate_explicit_idm_adapter_routes() -> None:
+    routed_agent = SimpleNamespace(
+        name="fb_ddpg",
+        idm_coef=0.1,
+        idm_lr=1e-4,
+        idm_encoder_mode="static",
+        idm_route="forward_adapter",
+        dino_separate_fb_adapters=True,
+        dino_use_adapter=True,
+    )
+    _validate_idm_training_config(
+        _idm_config(goal_space=None, agent=routed_agent)
+    )
+
+    with pytest.raises(ValueError, match="explicit agent.idm_route"):
+        _validate_idm_training_config(
+            _idm_config(
+                goal_space=None,
+                agent=SimpleNamespace(
+                    **{**vars(routed_agent), "idm_route": "none"}
+                ),
+            )
+        )
+    with pytest.raises(ValueError, match="goal_space=null"):
+        _validate_idm_training_config(
+            _idm_config(goal_space="simplified_walker", agent=routed_agent)
+        )
+    with pytest.raises(ValueError, match="idm_encoder_mode=static"):
+        _validate_idm_training_config(
+            _idm_config(
+                goal_space=None,
+                agent=SimpleNamespace(
+                    **{**vars(routed_agent), "idm_encoder_mode": "legacy"}
+                ),
+            )
+        )
 
 
 def test_idm_hydra_config_wiring() -> None:
@@ -90,6 +128,20 @@ def test_idm_hydra_config_wiring() -> None:
     _validate_idm_training_config(cfg)
 
     with initialize_config_dir(config_dir=config_dir, version_base=None):
+        single_frame = compose(
+            config_name="base_config",
+            overrides=[
+                "obs_type=dino",
+                "use_cls=true",
+                "dino_frame_stack=1",
+                "agent.idm_coef=0.1",
+                "agent.idm_lr=null",
+            ],
+        )
+    assert single_frame.dino_frame_stack == 1
+    _validate_idm_training_config(single_frame)
+
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
         balanced = compose(
             config_name="base_config",
             overrides=[
@@ -106,6 +158,26 @@ def test_idm_hydra_config_wiring() -> None:
     assert balanced.agent.idm_encoder_burnin_steps == 25000
     assert balanced.agent.idm_grad_ratio_target == 0.01
     _validate_idm_training_config(balanced)
+
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        routed = compose(
+            config_name="base_config",
+            overrides=[
+                "obs_type=dino",
+                "use_cls=true",
+                "dino_frame_stack=3",
+                "goal_space=null",
+                "agent.dino_separate_fb_adapters=true",
+                "agent.dino_adapter_type=mlp_ln",
+                "agent.idm_coef=0.1",
+                "agent.idm_lr=0.0001",
+                "agent.idm_encoder_mode=static",
+                "agent.idm_route=backward_adapter",
+            ],
+        )
+    assert routed.agent.dino_adapter_type == "mlp_ln"
+    assert routed.agent.idm_route == "backward_adapter"
+    _validate_idm_training_config(routed)
 
 
 def test_wandb_init_uses_stable_id_and_explicit_frame_axes() -> None:
@@ -435,6 +507,67 @@ def test_finalize_restores_training_state_when_cross_task_eval_fails(
     assert workspace.cfg.num_eval_episodes == 10
     assert workspace.eval_env is original_eval_env
     assert workspace.eval_rewards_history is original_history
+
+
+@pytest.mark.parametrize(
+    ("domain", "training_task", "expected_tasks"),
+    [
+        (
+            "jaco",
+            "jaco_reach_top_left",
+            {
+                "jaco_reach_top_left",
+                "jaco_reach_top_right",
+                "jaco_reach_bottom_left",
+                "jaco_reach_bottom_right",
+            },
+        ),
+        (
+            "point_mass_maze",
+            "point_mass_maze_reach_top_left",
+            {
+                "point_mass_maze_reach_top_left",
+                "point_mass_maze_reach_top_right",
+                "point_mass_maze_reach_bottom_left",
+                "point_mass_maze_reach_bottom_right",
+            },
+        ),
+    ],
+)
+def test_finalize_covers_corner_task_domains(
+    tmp_path: Path,
+    domain: str,
+    training_task: str,
+    expected_tasks: tp.Set[str],
+) -> None:
+    workspace = object.__new__(pretrain.BaseWorkspace)
+    workspace.work_dir = tmp_path
+    workspace.domain = domain
+    workspace.global_step = 10
+    workspace.cfg = SimpleNamespace(
+        task=training_task,
+        custom_reward=None,
+        seed=1,
+        num_eval_episodes=10,
+        final_tests=1,
+        use_wandb=False,
+        action_repeat=2,
+    )
+    workspace.eval_env = object()
+    workspace.eval_rewards_history = []
+    workspace._make_env = lambda: object()
+
+    def fake_eval(log_metrics: bool = True) -> float:
+        assert log_metrics is False
+        workspace.eval_rewards_history.append(1.0)
+        return 1.0
+
+    workspace.eval = fake_eval
+    workspace.finalize()
+
+    rewards = json.loads((tmp_path / "test_rewards.json").read_text())
+    assert set(rewards) == expected_tasks
+    assert all(values == [1.0] for values in rewards.values())
 
 
 @pytest.mark.parametrize(
