@@ -71,6 +71,10 @@ class Encoder(nn.Module):
     def forward(self, obs) -> Any:
         obs = obs / 255.0 - 0.5
         h = self.convnet(obs)
+        # Keep the original 84px representation and FB/actor head sizes when
+        # processing larger images (e.g. 224px), without resizing the input.
+        if h.shape[-2] > 35 or h.shape[-1] > 35:
+            h = F.adaptive_avg_pool2d(h, (35, 35))
         h = h.view(h.shape[0], -1)
         return h
 

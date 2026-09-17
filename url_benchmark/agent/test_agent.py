@@ -34,6 +34,116 @@ def test_agent_init() -> None:
     assert action.shape == (3,)
 
 
+def test_scale_gradient() -> None:
+    for scale in (0.0, 0.1, 1.0):
+        value = torch.randn(4, requires_grad=True)
+        output = fb_ddpg._scale_gradient(value, scale)  # pylint: disable=protected-access
+        assert torch.equal(output, value)
+        output.sum().backward()
+        assert value.grad is not None
+        assert torch.allclose(value.grad, torch.full_like(value, scale))
+
+
+def test_dino_separate_backward_adapter_one_update() -> None:
+    cfg = fb_ddpg.FBDDPGAgentConfig(
+        obs_shape=(8,),
+        action_shape=(2,),
+        obs_type="dino",
+        device="cpu",
+        num_expl_steps=0,
+        goal_space=None,
+        use_cls=True,
+        use_tb=True,
+        use_wandb=False,
+        use_hiplog=False,
+        update_encoder=True,
+        batch_size=4,
+        hidden_dim=16,
+        backward_hidden_dim=16,
+        feature_dim=8,
+        z_dim=8,
+        dino_adapter_output_dim=8,
+        dino_separate_backward_adapter=True,
+    )
+    agent = fb_ddpg.FBDDPGAgent(**dataclasses.asdict(cfg))
+    assert agent.backward_encoder is not None
+    assert agent.backward_encoder_target is not None
+    assert agent.encoder_opt is not None
+    assert agent.backward_encoder_opt is not None
+    assert not any(
+        left.data_ptr() == right.data_ptr()
+        for left, right in zip(agent.encoder.parameters(), agent.backward_encoder.parameters())
+    )
+
+    # A backward-only graph must not touch the forward/actor adapter.
+    agent.encoder_opt.zero_grad(set_to_none=True)
+    agent.backward_encoder_opt.zero_grad(set_to_none=True)
+    agent.backward_aug_and_encode(torch.randn(4, 8)).square().mean().backward()
+    assert all(param.grad is None for param in agent.encoder.parameters())
+    assert any(param.grad is not None for param in agent.backward_encoder.parameters())
+
+    batch = rb.EpisodeBatch(
+        obs=np.random.randn(4, 8).astype(np.float32),
+        action=np.random.uniform(-1, 1, size=(4, 2)).astype(np.float32),
+        reward=np.random.randn(4, 1).astype(np.float32),
+        next_obs=np.random.randn(4, 8).astype(np.float32),
+        discount=np.full((4, 1), 0.99, dtype=np.float32),
+        future_obs=np.random.randn(4, 8).astype(np.float32),
+    )
+
+    class _Replay:
+        def sample(self, batch_size: int) -> rb.EpisodeBatch:
+            assert batch_size == 4
+            return batch
+
+    forward_before = [param.detach().clone() for param in agent.encoder.parameters()]
+    backward_before = [param.detach().clone() for param in agent.backward_encoder.parameters()]
+    backward_target_before = [
+        param.detach().clone() for param in agent.backward_encoder_target.parameters()
+    ]
+    target_calls = 0
+
+    def _count_target_calls(_module, _inputs, _output) -> None:
+        nonlocal target_calls
+        target_calls += 1
+
+    target_hook = agent.backward_encoder_target.register_forward_hook(_count_target_calls)
+    metrics = agent.update(_Replay(), step=0)  # type: ignore[arg-type]
+    target_hook.remove()
+    assert "fb_loss" in metrics
+    assert "actor_loss" in metrics
+    assert target_calls == 1
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(forward_before, agent.encoder.parameters())
+    )
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(backward_before, agent.backward_encoder.parameters())
+    )
+    for before, online, target in zip(
+        backward_target_before,
+        agent.backward_encoder.parameters(),
+        agent.backward_encoder_target.parameters(),
+    ):
+        expected = cfg.fb_target_tau * online + (1 - cfg.fb_target_tau) * before
+        assert torch.allclose(target, expected)
+        assert target.grad is None
+
+    restored = fb_ddpg.FBDDPGAgent(**dataclasses.asdict(cfg))
+    restored.init_from(agent)
+    assert restored.backward_encoder is not None
+    assert restored.backward_encoder_target is not None
+    for expected, actual in zip(agent.backward_encoder.parameters(), restored.backward_encoder.parameters()):
+        assert torch.equal(expected, actual)
+    for expected, actual in zip(
+        agent.backward_encoder_target.parameters(), restored.backward_encoder_target.parameters()
+    ):
+        assert torch.equal(expected, actual)
+    assert restored.backward_encoder_opt is not None
+    assert restored.backward_encoder_opt.state_dict()["state"]
+
+
 def test_agents_config() -> None:
     cfgs = []
     for module in agents.__dict__.values():
