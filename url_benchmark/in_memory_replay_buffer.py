@@ -110,18 +110,22 @@ class ReplayBuffer:
             if np.isscalar(value):
                 value = np.full((1,), value, dtype=dtype)
             if isinstance(value, np.ndarray):
-                self._current_episode[field.name].append(np.array(value, dtype=dtype))
+                # Pixels remain bytes on the host; encoders convert sampled
+                # batches to float on the training device.
+                value_dtype = np.uint8 if field.name == 'observation' and value.dtype == np.uint8 else dtype
+                self._current_episode[field.name].append(np.array(value, dtype=value_dtype))
         if time_step.last():
             if not hasattr(self, "_batch_names"):
                 self._batch_names = set(field.name for field in dataclasses.fields(ExtendedGoalTimeStep))
             for name, value_list in self._current_episode.items():
-                values = np.array(value_list, dtype)
+                value_dtype = np.uint8 if name == 'observation' and value_list[0].dtype == np.uint8 else dtype
+                values = np.array(value_list, dtype=value_dtype)
                 if name not in self._storage:
                     # first iteration, the buffer is created with appropriate size
                     _shape = values.shape
                     if self._max_episode_length is not None:
                         _shape = (self._max_episode_length,) + _shape[1:]
-                    self._storage[name] = np.empty((self._max_episodes,) + _shape, dtype=dtype)
+                    self._storage[name] = np.empty((self._max_episodes,) + _shape, dtype=values.dtype)
                 self._storage[name][self._idx][:len(values)] = values
             self._episodes_length[self._idx] = len(self._current_episode['discount']) - 1  # compensate for the dummy transition at the beginning
             if self._episodes_length[self._idx] != self._episodes_length[self._idx - 1] and self._episodes_length[self._idx - 1] != 0:
@@ -200,10 +204,11 @@ class ReplayBuffer:
             # for field in dataclasses.fields(TimeStep):
             for name, values in episode.items():
                 # values = episode[field.name]
+                value_dtype = np.uint8 if name == 'observation' and values.dtype == np.uint8 else np.float32
                 if name not in self._storage:
                     # first iteration, the buffer is created with appropriate size
-                    self._storage[name] = np.empty((self._max_episodes,) + values.shape, dtype=np.float32)
-                self._storage[name][self._idx] = np.array(values, dtype=np.float32)
+                    self._storage[name] = np.empty((self._max_episodes,) + values.shape, dtype=value_dtype)
+                self._storage[name][self._idx] = np.array(values, dtype=value_dtype)
             self._idx = (self._idx + 1) % self._max_episodes
             self._full = self._full or self._idx == 0
 

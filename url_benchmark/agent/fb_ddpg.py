@@ -985,20 +985,50 @@ class FBDDPGAgent:
         meta['z'] = z
         return meta
 
-    def infer_meta(self, replay_loader: ReplayBuffer) -> MetaDict:
-        obs_list, reward_list = [], []
-        batch_size = 0
-        while batch_size < self.cfg.num_inference_steps:
-            batch = replay_loader.sample(self.cfg.batch_size)
-            batch = batch.to(self.cfg.device)
-            obs_list.append(batch.next_goal if self.cfg.goal_space is not None else batch.next_obs)
-            reward_list.append(batch.reward)
-            batch_size += batch.next_obs.size(0)
-        obs, reward = torch.cat(obs_list, 0), torch.cat(reward_list, 0)  # type: ignore
-        obs, reward = obs[:self.cfg.num_inference_steps], reward[:self.cfg.num_inference_steps]
-        return self.infer_meta_from_obs_and_rewards(obs, reward)
+    def infer_meta(self, replay_loader: ReplayBuffer, custom_reward: tp.Optional[tp.Any] = None) -> MetaDict:
+        def batches():
+            remaining = self.cfg.num_inference_steps
+            while remaining > 0:
+                size = min(self.cfg.batch_size, remaining)
+                if custom_reward is None:
+                    batch = replay_loader.sample(size)
+                else:
+                    batch = replay_loader.sample(size, custom_reward=custom_reward)
+                obs = batch.next_goal if self.cfg.goal_space is not None else batch.next_obs
+                yield obs, batch.reward
+                remaining -= size
+
+        return self._infer_meta_from_batches(batches())
 
     def infer_meta_from_obs_and_rewards(self, obs: torch.Tensor, reward: torch.Tensor) -> MetaDict:
+        if len(obs) != len(reward):
+            raise ValueError("inference observations and rewards must have the same length")
+        batches = (
+            (obs[start:start + self.cfg.batch_size], reward[start:start + self.cfg.batch_size])
+            for start in range(0, len(reward), self.cfg.batch_size)
+        )
+        return self._infer_meta_from_batches(batches)
+
+    @torch.no_grad()
+    def _infer_meta_from_batches(self, batches: tp.Iterable[tp.Tuple[tp.Any, tp.Any]]) -> MetaDict:
+        # Accumulate the same mean r(s) B(s) while keeping only one image batch
+        # on the device. Normalize once after combining all downstream rewards.
+        z_sum: tp.Optional[torch.Tensor] = None
+        reward_list = []
+        count = 0
+        for obs, reward in batches:
+            obs = torch.as_tensor(obs, device=self.cfg.device)
+            reward = torch.as_tensor(reward, dtype=torch.float32, device=self.cfg.device)
+            if self.cfg.goal_space is None and self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
+                obs = self.backward_aug_and_encode(obs)
+            B = self.backward_net(obs)
+            contribution = torch.matmul(reward.T, B)
+            z_sum = contribution if z_sum is None else z_sum + contribution
+            count += len(reward)
+            reward_list.append(reward.cpu())
+        if z_sum is None or count == 0:
+            raise ValueError("task inference requires at least one observation and reward")
+        reward = torch.cat(reward_list, 0)
         print('max reward: ', reward.max().cpu().item())
         print('99 percentile: ', torch.quantile(reward, 0.99).cpu().item())
         print('median reward: ', reward.median().cpu().item())
@@ -1006,16 +1036,7 @@ class FBDDPGAgent:
         print('mean reward: ', reward.mean().cpu().item())
         print('num reward: ', reward.shape[0])
 
-        # filter out small reward
-        # pdb.set_trace()
-        # idx = torch.where(reward >= torch.quantile(reward, 0.99))[0]
-        # obs = obs[idx]
-        # reward = reward[idx]
-        with torch.no_grad():
-            if self.cfg.goal_space is None and self.cfg.obs_type in VISUAL_ENCODER_OBS_TYPES:
-                obs = self.backward_aug_and_encode(obs)
-            B = self.backward_net(obs)
-        z = torch.matmul(reward.T, B) / reward.shape[0]
+        z = z_sum / count
         if self.cfg.norm_z:
             z = math.sqrt(self.cfg.z_dim) * F.normalize(z, dim=1)
         meta = OrderedDict()

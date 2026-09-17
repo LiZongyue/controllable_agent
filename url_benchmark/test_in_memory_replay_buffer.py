@@ -4,12 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import pickle
-from url_benchmark.dmc import TimeStep
+from url_benchmark.dmc import ExtendedGoalTimeStep, TimeStep
 from url_benchmark.in_memory_replay_buffer import ReplayBuffer
 
 from typing import List
 
 import numpy as np
+import torch
 from dm_env import StepType
 import pytest
 
@@ -65,3 +66,34 @@ def _create_dummy_episode(episode_length: int) -> List[TimeStep]:
             (3, 3)), reward=1, discount=1)
         time_steps.append(time_step)
     return time_steps
+
+
+def test_pixel_replay_keeps_lossless_uint8_and_float_training_fields() -> None:
+    replay = ReplayBuffer(max_episodes=2, discount=0.99, future=0.99)
+    frames = np.random.RandomState(3).randint(0, 256, (4, 3, 224, 224), dtype=np.uint8)
+    for i, pixels in enumerate(frames):
+        time_step = ExtendedGoalTimeStep(
+            step_type=StepType.FIRST if i == 0 else StepType.LAST if i == 3 else StepType.MID,
+            observation=pixels, reward=0.5, discount=1.0,
+            action=np.zeros(2), goal=np.zeros(3),
+        )._replace(physics=np.zeros(4))
+        replay.add(time_step, {"z": np.ones(2)})
+    np.testing.assert_array_equal(replay._storage["observation"][0], frames)
+    assert replay._storage["observation"].dtype == np.uint8
+    assert replay._storage["observation"].nbytes == 2 * frames.nbytes
+    batch = replay.sample(3).to("cpu")
+    assert all(value.dtype == torch.uint8 for value in (
+        batch.obs, batch.next_obs, batch.future_obs,
+    ))
+    for name in ("action", "reward", "discount", "physics", "goal", "z"):
+        assert replay._storage[name].dtype == np.float32
+
+
+def test_loading_pixel_replay_preserves_uint8(tmp_path) -> None:
+    frames = np.random.RandomState(4).randint(0, 256, (3, 3, 8, 8), dtype=np.uint8)
+    np.savez(tmp_path / "episode.npz", observation=frames, reward=np.ones((3, 1)))
+    replay = ReplayBuffer(max_episodes=1, discount=0.99, future=0.99)
+    replay.load(None, tmp_path, relabel=False)
+    assert replay._storage["observation"].dtype == np.uint8
+    np.testing.assert_array_equal(replay._storage["observation"][0], frames)
+    assert replay._storage["reward"].dtype == np.float32

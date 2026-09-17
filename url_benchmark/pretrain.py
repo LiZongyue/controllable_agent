@@ -87,6 +87,7 @@ class Config:
     append_goal_to_observation: bool = False
     # eval
     num_eval_episodes: int = 10
+    eval_tasks: tp.Tuple[str, ...] = ()  # reuse one trained agent across these same-domain tasks
     custom_reward: tp.Optional[str] = None  # activates custom eval if not None
     final_tests: int = 10
     # checkpoint
@@ -287,6 +288,13 @@ def _init_eval_meta(workspace: "BaseWorkspace", custom_reward: tp.Optional[_goal
             return workspace.agent.get_goal_meta(goal)
         except Exception:  # pylint: disable=broad-except
             pass
+        if isinstance(workspace.agent, agents.FBDDPGAgent):
+            # FB accumulates reward-weighted backward features a minibatch at a
+            # time. Collecting all inference observations here would retain
+            # thousands of full-resolution RGB frames on the GPU.
+            return workspace.agent.infer_meta(
+                workspace.replay_loader, custom_reward=custom_reward
+            )
         if not isinstance(workspace.agent, agents.SFSVDAgent):
             # we cannot fully type because of the FBBDPG string check :s
             num_steps = workspace.agent.cfg.num_inference_steps  # type: ignore
@@ -370,6 +378,12 @@ class BaseWorkspace(tp.Generic[C]):
             self.domain = 'point_mass'
         else:
             self.domain = task.split('_', maxsplit=1)[0]
+
+        eval_tasks = tuple(getattr(cfg, "eval_tasks", ()))
+        if len(eval_tasks) != len(set(eval_tasks)):
+            raise ValueError("eval_tasks must not contain duplicate tasks")
+        if any(not name.startswith(f"{self.domain}_") for name in eval_tasks):
+            raise ValueError("eval_tasks must belong to the training task's domain")
 
         self.train_env = self._make_env()
         self.eval_env = self._make_env()
@@ -537,13 +551,84 @@ class BaseWorkspace(tp.Generic[C]):
             log('step', self.global_step)
             log('episode', self.global_episode)
 
-    def eval(self, log_metrics: bool = True) -> float:
+    def _eval_task_suite(
+        self, tasks: tp.Sequence[str], repeat: int
+    ) -> tp.Dict[str, tp.List[float]]:
+        """Infer one reward-conditioned policy per task, without model updates."""
+        original = (
+            self.cfg.task, self.cfg.custom_reward, self.cfg.seed,
+            self.cfg.num_eval_episodes, self.eval_env, self.eval_rewards_history,
+        )
+        rewards: tp.Dict[str, tp.List[float]] = {}
+        try:
+            for index, task in enumerate(tasks):
+                self.cfg.task = task
+                self.cfg.custom_reward = task
+                self.cfg.seed = original[2] + index + 1
+                self.cfg.num_eval_episodes = 1
+                self.eval_rewards_history = []
+                task_env = None
+                task_reward = None
+                try:
+                    task_env = self._make_env()
+                    self.eval_env = task_env
+                    task_reward = self._make_custom_reward(seed=self.cfg.seed)
+                    with torch.no_grad(), utils.eval_mode(self.agent):
+                        meta = _init_eval_meta(self, task_reward)
+                    for _ in range(repeat):
+                        # This environment already runs the requested task.
+                        # Its native reward includes every action-repeat frame;
+                        # the relabeler is needed only to infer z from replay.
+                        self.eval(
+                            log_metrics=False, eval_meta=meta,
+                            eval_reward=task_reward, use_native_reward=True,
+                        )
+                    rewards[task] = list(self.eval_rewards_history)
+                finally:
+                    # Only one additional rendered environment is live at a
+                    # time, even when all four tasks are evaluated repeatedly.
+                    for env in (task_env, getattr(task_reward, "_env", None)):
+                        close = getattr(env, "close", None)
+                        if close is not None:
+                            close()
+        finally:
+            (self.cfg.task, self.cfg.custom_reward, self.cfg.seed,
+             self.cfg.num_eval_episodes, self.eval_env,
+             self.eval_rewards_history) = original
+        return rewards
+
+    def eval(
+        self, log_metrics: bool = True, *,
+        eval_meta: tp.Optional[agents.MetaDict] = None,
+        eval_reward: tp.Optional[_goals.BaseReward] = None,
+        use_native_reward: bool = False,
+    ) -> float:
+        tasks = tuple(getattr(self.cfg, "eval_tasks", ()))
+        if tasks and log_metrics:
+            rewards = self._eval_task_suite(tasks, self.cfg.num_eval_episodes)
+            task_means = {task: float(np.mean(values)) for task, values in rewards.items()}
+            mean_reward = task_means.get(self.cfg.task, float(np.mean(list(task_means.values()))))
+            self.eval_rewards_history.append(mean_reward)
+            with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
+                log('episode_reward', mean_reward)
+                log('episode', self.global_episode)
+                log('step', self.global_step)
+                for task, value in task_means.items():
+                    log(task, value)
+            with (self.work_dir / "eval_tasks.jsonl").open("a") as handle:
+                handle.write(json.dumps({"frame": self.global_frame, "rewards": rewards}) + "\n")
+            return mean_reward
+
         step, episode = 0, 0
         eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
         physics_agg = dmc.PhysicsAggregator()
         rewards: tp.List[float] = []
         normalized_scores: tp.List[float] = []
-        meta = _init_eval_meta(self)  # Don't work
+        # Custom rewards infer their own z below; avoid a redundant inference
+        # using the training reward before every evaluation task.
+        meta = eval_meta
+        if meta is None and self.cfg.custom_reward is None:
+            meta = _init_eval_meta(self)
         z_correl = 0.0
         is_d4rl_task = self.cfg.task.split('_')[0] == 'd4rl'
         actor_success: tp.List[float] = []
@@ -551,8 +636,8 @@ class BaseWorkspace(tp.Generic[C]):
             time_step = self.eval_env.reset()
             # create custom reward if need be (if field exists)
             seed = 12 * self.cfg.num_eval_episodes + len(rewards)
-            custom_reward = self._make_custom_reward(seed=seed)
-            if custom_reward is not None:
+            custom_reward = eval_reward or self._make_custom_reward(seed=seed)
+            if custom_reward is not None and eval_meta is None:
                 meta = _init_eval_meta(self, custom_reward)
             if self.domain == "grid":
                 meta = _init_eval_meta(self)
@@ -572,7 +657,7 @@ class BaseWorkspace(tp.Generic[C]):
                     if self.agent.cfg.additional_metric:
                         z_correl += self.agent.compute_z_correl(time_step, meta)
                         actor_success.extend(self.agent.actor_success)
-                if custom_reward is not None:
+                if custom_reward is not None and not use_native_reward:
                     time_step.reward = custom_reward.from_env(self.eval_env)
                 total_reward += time_step.reward
                 step += 1
@@ -580,7 +665,8 @@ class BaseWorkspace(tp.Generic[C]):
                 normalized_scores.append(self.eval_env.get_normalized_score(total_reward))
             rewards.append(total_reward)
             episode += 1
-            self.video_recorder.save(f'{self.global_frame}.mp4')
+            video_prefix = f'{self.cfg.task}_' if tasks else ''
+            self.video_recorder.save(f'{video_prefix}{self.global_frame}.mp4')
 
         mean_reward = float(np.mean(rewards))
         self.eval_rewards_history.append(mean_reward)
@@ -711,6 +797,8 @@ class BaseWorkspace(tp.Generic[C]):
                 self.cfg.num_eval_episodes = repeat
                 self.eval_maze_goals()
                 rewards["rewards"] = list(self.eval_rewards_history)
+            elif getattr(self.cfg, "eval_tasks", ()):
+                rewards = self._eval_task_suite(self.cfg.eval_tasks, repeat)
             else:
                 domain_tasks = {
                     "cheetah": ['walk', 'walk_backward', 'run', 'run_backward'],
